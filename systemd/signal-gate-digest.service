@@ -1,0 +1,39 @@
+[Unit]
+Description=Signal Gate daily digest report
+After=network-online.target signal-gate.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=signal-gate
+Group=signal-gate
+WorkingDirectory=/opt/signal-gate
+Environment=PYTHONUNBUFFERED=1
+Environment=SIGNAL_GATE_HOME=/opt/signal-gate
+Environment=SIGNAL_GATE_DB=/opt/signal-gate/data/signals.db
+Environment=SIGNAL_GATE_SECRETS=/opt/signal-gate/secrets.env
+EnvironmentFile=-/opt/signal-gate/secrets.env
+ExecStart=/usr/bin/python3 /opt/signal-gate/app/digest.py
+TimeoutStartSec=120
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/signal-gate/data /opt/signal-gate/inbox /opt/signal-gate/out
+MemoryMax=96M
+TasksMax=32

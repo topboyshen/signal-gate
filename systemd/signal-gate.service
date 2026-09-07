@@ -1,0 +1,46 @@
+[Unit]
+Description=Signal Gate pending-signals HMAC receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=signal-gate
+Group=signal-gate
+WorkingDirectory=/opt/signal-gate
+Environment=PYTHONUNBUFFERED=1
+Environment=SIGNAL_GATE_HOME=/opt/signal-gate
+Environment=SIGNAL_GATE_DB=/opt/signal-gate/data/signals.db
+Environment=SIGNAL_GATE_SECRETS=/opt/signal-gate/secrets.env
+Environment=SIGNAL_GATE_HOST=127.0.0.1
+Environment=SIGNAL_GATE_PORT=8095
+EnvironmentFile=-/opt/signal-gate/secrets.env
+ExecStart=/usr/bin/python3 /opt/signal-gate/app/server.py
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/signal-gate/data /opt/signal-gate/inbox /opt/signal-gate/out
+MemoryMax=128M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,43 @@
+# Default deny: only the reviewed source, documentation, units and offline test
+# below belong in this repository. Add new source paths deliberately.
+/*
+!/.gitignore
+!/README.md
+!/app/
+/app/*
+!/app/server.py
+!/app/review_bot.py
+!/app/digest.py
+!/app/selftest.py
+!/app/review_selftest.py
+!/app/e2e_forward_check.py
+!/docs/
+/docs/*
+!/docs/NGINX_PROXY.md
+!/docs/REVIEW.md
+!/systemd/
+/systemd/*
+!/systemd/signal-gate.service
+!/systemd/signal-gate-review.service
+!/systemd/signal-gate-digest.service
+!/systemd/signal-gate-digest.timer
+!/tests/
+/tests/*
+!/tests/test_offline.py
+
+# Defense in depth for runtime material, including nested copies.
+**/*.env
+**/.env*
+**/*public_url.txt
+**/nginx_path_token.txt
+**/data/
+**/out/
+**/inbox/
+**/__pycache__/
+**/*.py[cod]
+**/*.db
+**/*.db-*
+**/*.sqlite*
+**/*.log
+**/.venv/
+**/venv/
