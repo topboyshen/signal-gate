@@ -8,6 +8,7 @@
 !/app/server.py
 !/app/review_bot.py
 !/app/digest.py
+!/app/digest_content.py
 !/app/selftest.py
 !/app/review_selftest.py
 !/app/e2e_forward_check.py
@@ -24,6 +25,8 @@
 !/tests/
 /tests/*
 !/tests/test_offline.py
+!/tests/test_digest_content.py
+!/tests/test_digest_delivery.py
 
 # Defense in depth for runtime material, including nested copies.
 **/*.env

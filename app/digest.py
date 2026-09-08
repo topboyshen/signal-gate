@@ -1,425 +1,455 @@
 #!/usr/bin/env python3
-"""Daily digest: plain-language Chinese total report for Telegram."""
+"""Daily digest delivery with private, crash-safe receipts and offline preview."""
 from __future__ import annotations
 
+import argparse
+import fcntl
+import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 import re
-import sqlite3
+import stat
 import sys
+import tempfile
+import time
+from datetime import datetime
 import urllib.error
 import urllib.request
-from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
+
+try:
+    from digest_content import build_report
+except ModuleNotFoundError as exc:
+    if exc.name != "digest_content":
+        raise
+    # spec-based offline loaders do not add app/ to sys.path. Load the explicit
+    # sibling instead of changing global import paths or consulting production.
+    import importlib.util
+    _content_spec = importlib.util.spec_from_file_location(
+        "signal_gate_digest_content", Path(__file__).with_name("digest_content.py")
+    )
+    _content = importlib.util.module_from_spec(_content_spec)
+    _content_spec.loader.exec_module(_content)
+    build_report = _content.build_report
 
 BASE = Path(os.environ.get("SIGNAL_GATE_HOME", "/opt/signal-gate"))
 DB_PATH = Path(os.environ.get("SIGNAL_GATE_DB", str(BASE / "data" / "signals.db")))
 SECRETS_PATH = Path(os.environ.get("SIGNAL_GATE_SECRETS", str(BASE / "secrets.env")))
-INBOX = BASE / "inbox"
 OUT = BASE / "out"
 TZ = ZoneInfo("Asia/Shanghai")
-
-NOISE_KEY = re.compile(
-    r"(selftest|review-selftest|e2e-forward|nginx-probe|curl-valid|probe:|test:|dedirock:probe)",
-    re.I,
+MAX_PART_CHARS = 3500
+MAX_PARTS = 64
+DELIVERY_BUDGET_SECONDS = 90
+REQUEST_TIMEOUT_SECONDS = 15
+MAX_ACK_BYTES = 16384
+SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+SAFE_ISSUE = re.compile(
+    r"^(nng8|jd|quant|review):(missing|stale|unknown_date|future|invalid|schema_error|"
+    r"too_large|truncated|io_error|expiry_unknown|placeholder)$"
 )
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    stream=sys.stdout,
-)
+HEX_HASH = re.compile(r"^[0-9a-f]{64}$")
+STATUSES = {"confirmed", "failed", "unknown", "pending", "blocked"}
 log = logging.getLogger("signal-gate-digest")
 
 
+class DeliveryError(Exception):
+    def __init__(self, code: str, status: str = "failed"):
+        self.code = code if SAFE_CODE.fullmatch(code) else "delivery_error"
+        self.status = status if status in {"failed", "unknown", "blocked"} else "unknown"
+        super().__init__(self.code)
+
+
 def load_secrets(path: Path) -> dict[str, str]:
-    secrets: dict[str, str] = {}
-    if not path.is_file():
-        return secrets
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        secrets[k.strip()] = v.strip().strip('"').strip("'")
-    return secrets
+    values = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
 
 
-def is_noise_key(key: str | None) -> bool:
-    if not key:
+def split_text(text: str, limit: int = MAX_PART_CHARS) -> list[str]:
+    """Preserve every character, preferring line boundaries to hard splits."""
+    if not isinstance(text, str) or not text.strip() or limit < 1:
+        raise DeliveryError("report_invalid")
+    parts = []
+    remaining = text
+    while len(remaining) > limit:
+        boundary = remaining.rfind("\n", 0, limit)
+        cut = boundary + 1 if boundary >= limit // 2 else limit
+        parts.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        parts.append(remaining)
+    if len(parts) > MAX_PARTS:
+        raise DeliveryError("report_too_large")
+    return parts
+
+
+def code_version() -> str:
+    digest = hashlib.sha256()
+    for name in ("digest.py", "digest_content.py"):
+        digest.update(name.encode() + b"\0")
+        digest.update(Path(__file__).with_name(name).read_bytes())
+    return digest.hexdigest()
+
+
+def _timestamp(value: object) -> bool:
+    if not isinstance(value, str):
         return False
-    k = key.lower()
-    prefixes = (
-        "selftest",
-        "review-selftest",
-        "e2e-forward",
-        "nginx-probe",
-        "curl-valid",
-        "dedirock:probe",
-        "test:",
-        "research_eod:nng8:probe",
-    )
-    if k.startswith(prefixes) or ":probe:" in k or k.startswith("probe"):
-        # allow real keys that merely contain the letters "test" (e.g. reviewtest)
-        if k.startswith("test:"):
-            return True
-        if any(k.startswith(p) for p in prefixes if p != "test:"):
-            return True
-        if ":probe:" in k or k.startswith("probe"):
-            return True
+    try:
+        return datetime.fromisoformat(value).utcoffset() is not None
+    except ValueError:
         return False
-    return False
 
 
-def side_cn(side: object) -> str:
-    if side in (None, "", "null"):
-        return "方向不明"
-    s = str(side).lower()
-    if s in ("long", "buy", "多"):
-        return "偏多"
-    if s in ("short", "sell", "空"):
-        return "偏空"
-    return str(side)
-
-
-def load_json(path: Path) -> dict | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def read_text(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-
-
-def review_section(db_path: Path) -> list[str]:
-    lines = ["【人审结论】"]
-    if not db_path.is_file():
-        lines.append("缺报：尚无人审数据库。")
-        return lines
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = list(
-            conn.execute(
-                """
-                SELECT idempotency_key, symbol, signal_type, review_status, decision,
-                       reviewer, quant_status, confidence, body_json
-                FROM pending_signals
-                ORDER BY id DESC
-                """
-            )
-        )
-    real = [r for r in rows if not is_noise_key(r["idempotency_key"])]
-    pending = [r for r in real if (r["review_status"] or "pending") == "pending"]
-    approved = [r for r in real if r["decision"] == "approve"]
-    rejected = [r for r in real if r["decision"] == "reject"]
-    lines.append(
-        f"待审 {len(pending)} 条 · 通过 {len(approved)} 条 · 拒绝 {len(rejected)} 条"
-        f"（已过滤联调探针）"
-    )
-    if not real:
-        lines.append("今天还没有正式待审单。")
-        return lines
-    # show up to 5 latest real items
-    for r in real[:5]:
-        status = r["decision"] or r["review_status"] or "pending"
-        status_cn = {
-            "approve": "通过",
-            "reject": "拒绝",
-            "pending": "待审",
-            "reviewed": "已审",
-        }.get(str(status), str(status))
-        quant = r["quant_status"] or "-"
-        conf = r["confidence"]
-        conf_s = f"{float(conf):.2f}" if conf is not None else "-"
-        side_val = None
-        try:
-            body = json.loads(r["body_json"] or "{}")
-            if isinstance(body, dict):
-                side_val = body.get("side")
-        except (TypeError, json.JSONDecodeError):
-            side_val = None
-        lines.append(
-            f"- {r['symbol']}｜{status_cn}｜{side_cn(side_val)}"
-            f"｜置信 {conf_s}｜Quant {quant}"
-        )
-    if len(real) > 5:
-        lines.append(f"…另有 {len(real) - 5} 条未展开")
-    return lines
-
-
-def research_section() -> list[str]:
-    lines = ["【研究要点】"]
-    md = read_text(INBOX / "nng8" / "digest-latest.md")
-    data = load_json(INBOX / "nng8" / "digest-latest.json")
-    if not md and not data:
-        lines.append("缺报：研究摘要未送达。")
-        return lines
-
-    # Prefer explicit plain text fields from nnG8
-    if isinstance(data, dict):
-        for key in ("markdown", "text", "summary", "plain"):
-            val = data.get(key)
-            if isinstance(val, str) and val.strip() and len(val.strip()) > 10:
-                kept = []
-                for line in val.splitlines():
-                    s = line.strip()
-                    if not s or s.startswith("```"):
-                        continue
-                    kept.append(s)
-                    if len(kept) >= 8:
-                        break
-                lines.extend(kept)
-                return lines
-        signals = data.get("signals")
-        if isinstance(signals, list) and signals:
-            lines.append(f"信号 {len(signals)} 条")
-            for item in signals[:5]:
-                if not isinstance(item, dict):
-                    continue
-                lines.append(
-                    f"- {item.get('symbol','?')}｜{side_cn(item.get('side'))}"
-                    f"｜置信 {item.get('confidence','-')}"
-                )
-            return lines
-        # watchlist / observations style
-        for key in ("watchlist", "observations", "symbols", "items"):
-            arr = data.get(key)
-            if isinstance(arr, list) and arr:
-                lines.append(f"观察 {len(arr)} 项")
-                for item in arr[:5]:
-                    if isinstance(item, dict):
-                        sym = item.get("symbol") or item.get("code") or "?"
-                        note = item.get("note") or item.get("reason") or item.get("title") or ""
-                        note = str(note).replace("\n", " ").strip()
-                        if len(note) > 36:
-                            note = note[:36] + "…"
-                        lines.append(f"- {sym}｜{side_cn(item.get('side'))}" + (f"｜{note}" if note else ""))
-                    else:
-                        lines.append(f"- {item}")
-                return lines
-
-    if md:
-        blob = md.lower()
-        if ("skeleton" in blob or "not wired" in blob) and "观察" not in md:
-            lines.append("今日无有效研究信号（实盘 research_eod 尚未接入，仅健康态）。")
-            return lines
-        kept = []
-        for line in md.splitlines():
-            s = line.strip()
-            if not s or s.startswith("```") or s.startswith("{"):
-                continue
-            if any(x in s.lower() for x in ("not wired", "skeleton", "digest skeleton")):
-                continue
-            kept.append(s)
-            if len(kept) >= 8:
-                break
-        if kept:
-            lines.extend(kept)
-            return lines
-
-    lines.append("研究摘要已到，但未能解析出可读要点。")
-    return lines
-
-
-def news_section() -> list[str]:
-    lines = ["【资讯要点】"]
-    md = read_text(INBOX / "jd" / "digest-latest.md")
-    data = load_json(INBOX / "jd" / "digest-latest.json")
-    if not md and not data:
-        lines.append("缺报：资讯摘要未送达。")
-        return lines
-
-    items: list[dict] = []
-    if data:
-        raw_items = data.get("items") or data.get("events") or data.get("top") or []
-        if isinstance(raw_items, list):
-            for it in raw_items:
-                if isinstance(it, dict):
-                    items.append(it)
-
-    # Deduplicate by symbol, prefer higher confidence, skip pure index spam somewhat
-    best: dict[str, dict] = {}
-    for it in items:
-        sym = str(it.get("symbol") or it.get("code") or "").strip()
-        if not sym:
-            continue
-        # soft-filter common index codes if many — still allow but rank lower later
-        conf = it.get("confidence")
-        try:
-            conf_f = float(conf) if conf is not None else 0.0
-        except (TypeError, ValueError):
-            conf_f = 0.0
-        prev = best.get(sym)
-        if prev is None or conf_f >= float(prev.get("_conf", 0)):
-            it = dict(it)
-            it["_conf"] = conf_f
-            best[sym] = it
-
-    ranked = sorted(best.values(), key=lambda x: x.get("_conf", 0), reverse=True)
-    # Prefer non-399/000688-looking? Keep all but limit 6
-    if ranked:
-        lines.append(f"高置信约 {len(ranked)} 只标的（去重后）")
-        for it in ranked[:6]:
-            title = it.get("title") or it.get("reason") or it.get("summary") or "—"
-            title = str(title).replace("\n", " ").strip()
-            if len(title) > 40:
-                title = title[:40] + "…"
-            lines.append(
-                f"- {it.get('symbol')}｜{side_cn(it.get('side'))}"
-                f"｜置信 {it.get('_conf', 0):.2f}｜{title}"
-            )
-    elif md:
-        # parse simple bullet lines from md, skip noise
-        bullets = []
-        header = None
-        for line in md.splitlines():
-            s = line.strip()
-            if not s:
-                continue
-            if s.startswith("[JD") or s.startswith("资讯"):
-                header = s
-                continue
-            if s.startswith("-"):
-                # drop truncated evt ids heavy lines a bit — keep symbol-ish
-                if "selftest" in s.lower() or "probe" in s.lower():
-                    continue
-                bullets.append(s.lstrip("- "))
-        if header:
-            # rewrite header into plain
-            m = re.search(r"items=(\d+)", header)
-            n = m.group(1) if m else str(len(bullets))
-            lines.append(f"高置信资讯约 {n} 条")
-        for b in bullets[:6]:
-            # transform "399006.SZ side=long conf=0.99 evt=..." 
-            mm = re.match(
-                r"(?P<sym>[0-9]{6}\.(?:SH|SZ))\s+side=(?P<side>\S+)\s+conf=(?P<conf>\S+)",
-                b,
-            )
-            if mm:
-                lines.append(
-                    f"- {mm.group('sym')}｜{side_cn(None if mm.group('side') in ('None','null') else mm.group('side'))}"
-                    f"｜置信 {mm.group('conf')}"
-                )
-            else:
-                lines.append(f"- {b[:60]}")
-    else:
-        lines.append("有摘要文件，但未能解析出个股要点。")
-    return lines
-
-
-def execution_section() -> list[str]:
-    lines = ["【执行摘要】"]
-    data = load_json(INBOX / "quant" / "digest-latest.json")
-    if not data:
-        lines.append("缺报：执行摘要未送达。")
-        return lines
-    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
-    accepted = summary.get("accepted", data.get("accepted"))
-    rejected = summary.get("rejected", data.get("rejected"))
-    fills = summary.get("fills", data.get("fills"))
-    pnl = summary.get("pnl", data.get("pnl"))
-    note = summary.get("note") or data.get("note") or ""
-
-    # Count non-noise items if present
-    items = data.get("items") if isinstance(data.get("items"), list) else []
-    real_items = [
-        it
-        for it in items
-        if isinstance(it, dict) and not is_noise_key(str(it.get("idempotency_key") or ""))
-    ]
-    noise_n = len(items) - len(real_items)
-
-    lines.append(
-        f"受理 {accepted if accepted is not None else '-'} 条 · "
-        f"拒绝 {rejected if rejected is not None else '-'} 条"
-    )
-    if fills in (None, 0) or "stub" in str(note).lower() or "未启用" in str(note):
-        lines.append("成交与盈亏：未启用（不接实盘）")
-    else:
-        lines.append(f"成交 {fills} · 盈亏 {pnl}")
-    if noise_n > 0:
-        lines.append(f"（原始受理里含 {noise_n} 条联调探针，阅读时可忽略）")
-    if real_items:
-        lines.append("正式相关：")
-        for it in real_items[:5]:
-            lines.append(
-                f"- {it.get('symbol','?')}｜{it.get('status','?')}｜{side_cn(it.get('side'))}"
-            )
-    return lines
-
-
-def render_digest(day: str) -> str:
-    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
-    parts: list[str] = [
-        f"A股联动日报 {day}",
-        f"生成时间 {now}（北京时间）",
-        "",
-    ]
-    for section in (
-        review_section(DB_PATH),
-        research_section(),
-        news_section(),
-        execution_section(),
+def _safe_issues(value: object) -> list[str]:
+    if not isinstance(value, list) or len(value) > 64 or any(
+        not isinstance(item, str) or len(item) > 64 or not SAFE_ISSUE.fullmatch(item) for item in value
     ):
-        parts.extend(section)
-        parts.append("")
-    parts.append("说明：只保留可读摘要；原始 JSON / 探针已隐藏。")
-    return "\n".join(parts).strip() + "\n"
+        raise DeliveryError("report_invalid")
+    return sorted(set(value))
 
 
-def send_telegram(token: str, chat_id: str, text: str) -> bool:
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = json.dumps(
-        {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True},
-        ensure_ascii=False,
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=payload, method="POST", headers={"Content-Type": "application/json"}
-    )
+def _validated_report(value: object, day: str) -> dict:
+    if not isinstance(value, dict) or value.get("report_date") != day:
+        raise DeliveryError("report_invalid")
+    text = value.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text) > 100_000:
+        raise DeliveryError("report_invalid")
+    issues = _safe_issues(value.get("issues"))
+    if not isinstance(value.get("degraded"), bool) or value["degraded"] != bool(issues):
+        raise DeliveryError("report_invalid")
+    return {"report_date": day, "text": text,
+            "issues": issues, "degraded": value["degraded"]}
+
+
+def _private_directory(path: Path, *, create: bool = True) -> None:
+    if create:
+        path.mkdir(mode=0o700, exist_ok=True)
+    if not stat.S_ISDIR(path.lstat().st_mode):
+        raise DeliveryError("state_unavailable", "blocked")
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise DeliveryError("state_unavailable", "blocked")
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            log.info("telegram send status=%s bytes=%s", resp.status, len(raw))
-            return 200 <= resp.status < 300
-    except (urllib.error.URLError, TimeoutError) as exc:
-        log.error("telegram send failed: %s", exc)
-        return False
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
-def main() -> int:
-    day = datetime.now(TZ).strftime("%Y-%m-%d")
-    OUT.mkdir(parents=True, exist_ok=True)
-    report = render_digest(day)
-    out_path = OUT / f"daily-{day}.md"
-    out_path.write_text(report, encoding="utf-8")
-    log.info("wrote digest %s (%s bytes)", out_path, len(report.encode()))
+def write_receipt(path: Path, receipt: dict) -> None:
+    receipt["updated_at"] = datetime.now(TZ).isoformat()
+    _atomic_write(path, (json.dumps(receipt, ensure_ascii=True, sort_keys=True) + "\n").encode())
 
-    secrets = load_secrets(SECRETS_PATH)
-    token = secrets.get("TELEGRAM_DIGEST_BOT_TOKEN", "").strip()
-    chat_id = secrets.get("TELEGRAM_DIGEST_CHAT_ID", "").strip()
-    if token and chat_id:
-        ok = send_telegram(token, chat_id, report)
-        if ok:
-            log.info("telegram digest sent")
-            return 0
-        log.error("telegram digest failed")
+
+def read_receipt(path: Path, day: str) -> dict | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+            or (info.st_uid, info.st_gid) != (os.geteuid(), os.getegid()) or info.st_size > 65536):
+        raise DeliveryError("receipt_invalid", "blocked")
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        keys = {"schema_version", "report_date", "status", "updated_at", "generated_at",
+                "content_sha256", "code_version", "issues", "parts", "last_error_code"}
+        if not isinstance(receipt, dict) or set(receipt) not in (keys, keys | {"confirmed_at"}):
+            raise ValueError
+        if type(receipt["schema_version"]) is not int or receipt["schema_version"] != 1:
+            raise ValueError
+        if receipt["report_date"] != day or receipt["status"] not in STATUSES:
+            raise ValueError
+        if not all(_timestamp(receipt[key]) for key in ("updated_at", "generated_at")):
+            raise ValueError
+        if not all(isinstance(receipt[key], str) and HEX_HASH.fullmatch(receipt[key])
+                   for key in ("content_sha256", "code_version")):
+            raise ValueError
+        _safe_issues(receipt["issues"])
+        if not isinstance(receipt["last_error_code"], str) or not SAFE_CODE.fullmatch(receipt["last_error_code"]):
+            raise ValueError
+        parts = receipt["parts"]
+        if not isinstance(parts, list) or len(parts) > MAX_PARTS:
+            raise ValueError
+        confirmed_ids = set()
+        for index, part in enumerate(parts, 1):
+            if not isinstance(part, dict) or set(part) != {"index", "status", "message_id"}:
+                raise ValueError
+            if type(part["index"]) is not int or part["index"] != index:
+                raise ValueError
+            if part["status"] not in {"confirmed", "failed", "unknown", "pending"}:
+                raise ValueError
+            message_id = part["message_id"]
+            if part["status"] == "confirmed":
+                if type(message_id) is not int or message_id <= 0 or message_id in confirmed_ids:
+                    raise ValueError
+                confirmed_ids.add(message_id)
+            elif message_id is not None:
+                raise ValueError
+        if receipt["status"] == "confirmed" and (
+            not parts or any(part["status"] != "confirmed" for part in parts)
+            or not _timestamp(receipt.get("confirmed_at"))
+        ):
+            raise ValueError
+        return receipt
+    except (ValueError, TypeError, KeyError, DeliveryError, OSError):
+        raise DeliveryError("receipt_invalid", "blocked") from None
+
+
+def _decode_ack(raw: bytes) -> dict:
+    if len(raw) > MAX_ACK_BYTES:
+        raise DeliveryError("ack_invalid", "unknown")
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise DeliveryError("ack_invalid", "unknown") from None
+    if not isinstance(value, dict):
+        raise DeliveryError("ack_invalid", "unknown")
+    return value
+
+
+def send_telegram(token: str, chat_id: str, text: str, *, deadline: float | None = None) -> int:
+    """Return a confirmed message id; retry only explicit rejected 429 responses."""
+    deadline = time.monotonic() + DELIVERY_BUDGET_SECONDS if deadline is None else deadline
+    payload = json.dumps({"chat_id": chat_id, "text": text,
+                          "disable_web_page_preview": True}).encode("utf-8")
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DeliveryError("delivery_budget_exceeded")
+        status = 0
+        try:
+            with urllib.request.urlopen(request, timeout=min(REQUEST_TIMEOUT_SECONDS, remaining)) as response:
+                status = response.status
+                raw = response.read(MAX_ACK_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            try:
+                raw = exc.read(MAX_ACK_BYTES + 1)
+            except Exception:
+                raw = b""
+        except (TimeoutError, urllib.error.URLError):
+            raise DeliveryError("network_unknown", "unknown") from None
+        except Exception:
+            raise DeliveryError("transport_unknown", "unknown") from None
+        if type(status) is not int:
+            raise DeliveryError("ack_invalid", "unknown")
+        if status >= 500 or status == 408:
+            raise DeliveryError("upstream_unknown", "unknown")
+        try:
+            ack = _decode_ack(raw)
+        except DeliveryError:
+            if 400 <= status < 500:
+                raise DeliveryError("rate_limited" if status == 429 else "request_rejected") from None
+            raise
+        rejected = ack.get("ok") is False
+        error_code = ack.get("error_code")
+        rate_limited = status == 429 or (rejected and type(error_code) is int and error_code == 429)
+        if rate_limited:
+            parameters = ack.get("parameters")
+            delay = parameters.get("retry_after") if isinstance(parameters, dict) else None
+            if (not rejected or type(delay) is not int or not 0 <= delay <= 10
+                    or attempt >= 2 or delay + 1 >= deadline - time.monotonic()):
+                raise DeliveryError("rate_limited")
+            time.sleep(delay)
+            continue
+        if 400 <= status < 500:
+            raise DeliveryError("auth_rejected" if status in (401, 403) else "request_rejected")
+        if rejected and type(error_code) is int and 400 <= error_code < 500:
+            raise DeliveryError("auth_rejected" if error_code in (401, 403) else "request_rejected")
+        result = ack.get("result")
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        if not (200 <= status < 300 and ack.get("ok") is True
+                and type(message_id) is int and message_id > 0):
+            raise DeliveryError("ack_invalid", "unknown")
+        return message_id
+    raise DeliveryError("rate_limited")
+
+
+def _new_receipt(day: str, now: datetime, version: str, text: str, issues: list[str]) -> dict:
+    return {"schema_version": 1, "report_date": day, "status": "pending",
+            "updated_at": now.isoformat(), "generated_at": now.isoformat(),
+            "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "code_version": version, "issues": issues,
+            "parts": [{"index": index, "status": "pending", "message_id": None}
+                      for index, _ in enumerate(split_text(text) if text else [], 1)],
+            "last_error_code": "none"}
+
+
+def _event(day: str, status: str, code: str, receipt: dict | None = None) -> None:
+    parts = receipt["parts"] if receipt else []
+    print(f"digest_delivery report_date={day} status={status} code={code} "
+          f"parts_total={len(parts)} parts_confirmed={sum(p['status'] == 'confirmed' for p in parts)} "
+          f"issues={len(receipt['issues']) if receipt else 0}")
+
+
+def run_digest(*, dry_run: bool = False, json_output: bool = False, now: datetime | None = None) -> int:
+    now = datetime.now(TZ) if now is None else now.astimezone(TZ)
+    day = now.date().isoformat()
+    deadline = time.monotonic() + DELIVERY_BUDGET_SECONDS
+    try:
+        version = code_version()
+    except Exception:
+        if dry_run and json_output:
+            print(json.dumps({"report_date": day, "status": "failed", "issues": ["code_unavailable"]}))
+        else:
+            _event(day, "failed", "code_unavailable")
         return 1
-    missing = []
-    if not token:
-        missing.append("TELEGRAM_DIGEST_BOT_TOKEN")
-    if not chat_id:
-        missing.append("TELEGRAM_DIGEST_CHAT_ID")
-    log.warning("telegram skipped missing=%s", ",".join(missing))
-    return 0
+    if dry_run:
+        try:
+            report = _validated_report(build_report(BASE, DB_PATH, now=now), day)
+            preview = {"schema_version": 1, "report_date": day, "status": "dry_run",
+                       "generated_at": now.isoformat(), "issues": report["issues"],
+                       "degraded": report["degraded"], "code_version": version,
+                       "content_sha256": hashlib.sha256(report["text"].encode()).hexdigest(),
+                       "parts_total": len(split_text(report["text"])), "chars": len(report["text"])}
+            print(json.dumps(preview, sort_keys=True) if json_output else report["text"])
+            return 0
+        except Exception:
+            if json_output:
+                print(json.dumps({"report_date": day, "status": "failed", "issues": ["render_failed"]}))
+            else:
+                _event(day, "failed", "render_failed")
+            return 1
+    lock_descriptor = None
+    receipt = None
+    receipt_path = OUT / "delivery" / f"{day}.json"
+    try:
+        _private_directory(BASE, create=False)
+        _private_directory(OUT)
+        _private_directory(OUT / "delivery")
+        directory_info = (OUT / "delivery").lstat()
+        if ((directory_info.st_uid, directory_info.st_gid) != (os.geteuid(), os.getegid())
+                or stat.S_IMODE(directory_info.st_mode) != 0o700):
+            raise DeliveryError("state_unavailable", "blocked")
+        lock_descriptor = os.open(
+            OUT / "delivery" / f".{day}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+        )
+        os.fchmod(lock_descriptor, 0o600)
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _event(day, "blocked", "delivery_busy")
+            return 1
+        receipt = read_receipt(receipt_path, day)
+        if receipt and receipt["status"] == "confirmed":
+            _event(day, "confirmed", "already_confirmed", receipt)
+            return 0
+        if receipt and (receipt["status"] == "unknown" or any(p["status"] == "unknown" for p in receipt["parts"])):
+            receipt.update(status="unknown", last_error_code="acceptance_unknown")
+            write_receipt(receipt_path, receipt)
+            _event(day, "unknown", "acceptance_unknown", receipt)
+            return 1
+        if receipt and receipt["parts"] and all(p["status"] == "confirmed" for p in receipt["parts"]):
+            # All individual acknowledgements survived, but a crash may have
+            # interrupted only the final overall receipt update.
+            receipt.update(status="confirmed", last_error_code="none", confirmed_at=now.isoformat())
+            write_receipt(receipt_path, receipt)
+            _event(day, "confirmed", "confirmation_recovered", receipt)
+            return 0
+        if receipt and receipt["status"] == "blocked":
+            _event(day, "blocked", receipt["last_error_code"], receipt)
+            return 1
+        try:
+            report = _validated_report(build_report(BASE, DB_PATH, now=now), day)
+        except Exception:
+            receipt = receipt or _new_receipt(day, now, version, "", [])
+            raise DeliveryError("render_failed") from None
+        parts = split_text(report["text"])
+        content_hash = hashlib.sha256(report["text"].encode()).hexdigest()
+        partial = receipt and any(p["status"] == "confirmed" for p in receipt["parts"])
+        if partial and (receipt["content_sha256"] != content_hash or len(receipt["parts"]) != len(parts)):
+            raise DeliveryError("partial_content_changed", "blocked")
+        if not partial:
+            receipt = _new_receipt(day, now, version, report["text"], report["issues"])
+        else:
+            receipt.update(code_version=version, issues=report["issues"])
+        try:
+            secrets = load_secrets(SECRETS_PATH)
+        except Exception:
+            raise DeliveryError("config_unavailable") from None
+        token = secrets.get("TELEGRAM_DIGEST_BOT_TOKEN", "").strip()
+        chat_id = secrets.get("TELEGRAM_DIGEST_CHAT_ID", "").strip()
+        if not token or not chat_id:
+            raise DeliveryError("config_missing")
+        if not re.fullmatch(r"[0-9]{1,20}:[A-Za-z0-9_-]{20,}", token) or not re.fullmatch(r"-?[0-9]+", chat_id):
+            raise DeliveryError("config_invalid")
+        write_receipt(receipt_path, receipt)
+        _atomic_write(OUT / f"daily-{day}.md", report["text"].encode("utf-8"))
+        for index, text in enumerate(parts):
+            part = receipt["parts"][index]
+            if part["status"] == "confirmed":
+                continue
+            # Persist uncertainty before the POST. A crash cannot cause blind resend.
+            receipt.update(status="pending", last_error_code="none")
+            part.update(status="unknown", message_id=None)
+            write_receipt(receipt_path, receipt)
+            try:
+                message_id = send_telegram(token, chat_id, text, deadline=deadline)
+                if type(message_id) is not int or message_id <= 0:
+                    raise DeliveryError("ack_invalid", "unknown")
+                if any(existing["status"] == "confirmed" and existing["message_id"] == message_id
+                       for existing in receipt["parts"]):
+                    raise DeliveryError("ack_invalid", "unknown")
+            except DeliveryError as exc:
+                part["status"] = exc.status if exc.status in {"failed", "unknown"} else "failed"
+                raise
+            except Exception:
+                raise DeliveryError("transport_unknown", "unknown") from None
+            part.update(status="confirmed", message_id=message_id)
+            write_receipt(receipt_path, receipt)
+        receipt.update(status="confirmed", last_error_code="none", confirmed_at=datetime.now(TZ).isoformat())
+        write_receipt(receipt_path, receipt)
+        _event(day, "confirmed", "sent", receipt)
+        return 0
+    except DeliveryError as exc:
+        if receipt is not None:
+            receipt.update(status=exc.status, last_error_code=exc.code)
+            try:
+                write_receipt(receipt_path, receipt)
+            except Exception:
+                _event(day, "unknown", "state_write_failed")
+                return 1
+        _event(day, exc.status, exc.code, receipt)
+        return 1
+    except Exception:
+        _event(day, "unknown", "state_unavailable")
+        return 1
+    finally:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Signal Gate daily digest")
+    parser.add_argument("--dry-run", action="store_true", help="render without credentials, delivery or state writes")
+    parser.add_argument("--json", action="store_true", help="safe metadata only; requires --dry-run")
+    args = parser.parse_args([] if argv is None else argv)
+    if args.json and not args.dry_run:
+        parser.error("--json requires --dry-run")
+    return run_digest(dry_run=args.dry_run, json_output=args.json)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

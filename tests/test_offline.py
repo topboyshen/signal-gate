@@ -2,6 +2,7 @@
 """Offline regression only: synthetic inputs, temporary state, no live IO."""
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 import hashlib
 import hmac
 import importlib.util
@@ -16,6 +17,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 import urllib.request
+from urllib.parse import unquote, urlsplit
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -70,7 +72,8 @@ class OfflineTests(unittest.TestCase):
         self.quant = self.patched(
             self.review, "post_to_quant", return_value=(200, '{"ok":true,"offline":true}')
         )
-        self.digest_send = self.patched(self.digest, "send_telegram", return_value=True)
+        # A confirmed Telegram part requires a positive message ID, not truthiness.
+        self.digest_send = self.patched(self.digest, "send_telegram", return_value=101)
         self.server.init_db(self.db)
         self.secret = "offline-hmac"
         self.actor = "101"
@@ -92,7 +95,14 @@ class OfflineTests(unittest.TestCase):
         self.socket.assert_not_called()
 
     def temporary_connect(self, database, *args, **kwargs):
-        path = Path(os.fspath(database)).resolve()
+        value = os.fspath(database)
+        if kwargs.get("uri"):
+            parsed = urlsplit(value)
+            if parsed.scheme != "file" or parsed.netloc:
+                raise AssertionError("non-local database URI forbidden")
+            path = Path(unquote(parsed.path)).resolve()
+        else:
+            path = Path(value).resolve()
         if not path.is_relative_to(self.root):
             raise AssertionError("non-temporary database forbidden")
         return REAL_CONNECT(database, *args, **kwargs)
@@ -206,13 +216,21 @@ class OfflineTests(unittest.TestCase):
     def test_digest_uses_only_temporary_artifacts_and_mocked_telegram(self):
         self.pending()
         with patch.object(self.digest, "load_secrets", return_value={
-            "TELEGRAM_DIGEST_BOT_TOKEN": "offline-token",
+            "TELEGRAM_DIGEST_BOT_TOKEN": "1:" + "x" * 24,
             "TELEGRAM_DIGEST_CHAT_ID": self.actor,
-        }):
+        }), redirect_stdout(io.StringIO()):
             self.assertEqual(self.digest.main(), 0)
         reports = list((self.root / "out").glob("daily-*.md"))
         self.assertEqual(len(reports), 1)
-        self.assertIn("offline-1", reports[0].read_text())
+        # The readable digest deliberately hides internal idempotency keys.
+        self.assertIn("000001.SZ", reports[0].read_text())
+        self.assertNotIn("offline-1", reports[0].read_text())
+        receipts = list((self.root / "out" / "delivery").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual(receipt["status"], "confirmed")
+        self.assertTrue(receipt["parts"])
+        self.assertTrue(all(part["message_id"] == 101 for part in receipt["parts"]))
         self.digest_send.assert_called_once()
 
 
