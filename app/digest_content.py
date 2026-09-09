@@ -120,6 +120,26 @@ def side(value: object) -> str:
     return {"long": "偏多", "buy": "偏多", "多": "偏多", "short": "偏空", "sell": "偏空", "空": "偏空"}.get(str(value).lower(), "方向未知")
 
 
+def first_text(data: dict, fields: tuple[str, ...], limit: int = MAX_TEXT) -> str:
+    """Only explicit text fields, never repr() an arbitrary nested payload."""
+    for field in fields:
+        value = data.get(field)
+        if isinstance(value, str) and value.strip():
+            return clean(value, limit)
+    return ""
+
+
+def research_section(value: str) -> str:
+    """Recognize producer labels, not market sentiment or trading priority."""
+    if re.match(r"^(?:观察(?:标的|池|清单|方向|要点)?|今日关注|重点关注|关注标的|策略)", value):
+        return "watch"
+    if re.match(r"^(?:板块|行业|题材)[：:]", value):
+        return "sector"
+    if re.match(r"^(?:大盘|市场)[：:]|^(?:成交额|成交量|涨跌家数)(?:[：:\s]|\d)", value):
+        return "market"
+    return ""
+
+
 class Renderer:
     def __init__(self, base: Path, db_path: Path, now: datetime):
         self.base, self.db_path, self.now = base.resolve(), db_path, now
@@ -221,17 +241,33 @@ class Renderer:
                 if is_noise(item):
                     filtered += 1
                     continue
-                title = item.get("title") or item.get("note") or item.get("reason") or item.get("summary")
+                provenance = item.get("provenance", {})
+                if not isinstance(provenance, dict):
+                    self.issue(name, "schema_error")
+                    provenance = {}
+                event_key = provenance.get("event_id")
+                if is_noise(provenance) or (isinstance(event_key, str) and is_noise({"idempotency_key": event_key})):
+                    filtered += 1
+                    continue
+                title = first_text(item, ("title", "note", "reason", "summary")) or first_text(provenance, ("title", "note", "reason", "summary"))
                 symbol = clean(item.get("symbol") or item.get("code"), 24)
-                title = clean(title)
                 if not symbol and not title:
                     self.issue(name, "schema_error")
                     invalid_items += 1
                     continue
                 line = "｜".join(part for part in (symbol, side(item.get("side")) if symbol else "", title) if part)
-                date_key = next((key for key in ("published_at", "timestamp", "as_of", "date") if key in item), None)
-                stamp = parse_date(item[date_key]) if date_key else None
-                if date_key and stamp is None:
+                # event_window is a signal-validity window, not publication time.
+                date_fields = ("published_at", "timestamp", "as_of", "date")
+                stamp = None
+                for date_data in (item, provenance):
+                    date_key = next((key for key in date_fields if key in date_data), None)
+                    if date_key is None:
+                        continue
+                    stamp = parse_date(date_data[date_key])
+                    if stamp is not None:
+                        break
+                    # Still show a valid nested timestamp, but do not hide the
+                    # malformed authoritative field by reporting a healthy input.
                     self.issue(name, "invalid")
                 if stamp:
                     line += f"（{stamp.strftime('%Y-%m-%d %H:%M')}）"
@@ -239,7 +275,11 @@ class Renderer:
                         self.issue(name, "future")
                     elif self.now - stamp > timedelta(hours=72):
                         self.issue(name, "stale")
-                link = safe_url(item.get("url") or item.get("link") or item.get("source_url"))
+                publisher = first_text(item, ("source",), 60) or first_text(provenance, ("source",), 60)
+                if publisher:
+                    line += f"｜来源：{publisher}"
+                link = next((safe_url(mapping.get(key)) for mapping in (item, provenance)
+                             for key in ("url", "link", "source_url") if safe_url(mapping.get(key))), "")
                 if link:
                     line += f" {link}"
                 if line not in kept:
@@ -255,24 +295,94 @@ class Renderer:
         if text and any(word in text.lower() for word in ("skeleton", "not wired")):
             self.issue(name, "placeholder")
             return [f"{LABELS[name]}：仅占位摘要，尚无有效要点。"]
-        lines = []
+        return self.text_highlights(name, text)
+
+    def text_highlights(self, name: str, text: str) -> list[str]:
+        # Build bounded semantic blocks: a watch-list label and its bullets are
+        # one unit; market and turnover form one overview. Preserve input order
+        # within each section. No model, importance score, or invented analysis.
+        blocks: list[tuple[str, str]] = []
+        notes: list[tuple[int, str]] = []
+        shortened = False
+        collecting = ""
+        fenced = False
         for raw_line in text.splitlines()[:MAX_ROWS]:
-            value = clean(raw_line.strip().lstrip("#*- "))
+            if raw_line.strip().startswith("```"):
+                fenced = not fenced
+                collecting = ""
+                continue
+            if fenced:
+                continue
+            full_value = clean(raw_line.strip().lstrip("#*- "), MAX_BODY)
+            value = clean(full_value)
+            if len(full_value) > MAX_TEXT:
+                shortened = True
             if is_noise({"idempotency_key": value}) or re.search(r"(?i)(selftest|e2e-forward|nginx-probe|dedirock:probe|\bprobe[:=])", value):
                 continue
-            if value and not raw_line.strip().startswith(("```", "{")) and not re.match(r"(?i)^(as_of|date|日期|数据日期|来源日期|生成时间)\s*[:：=]", value):
-                lines.append(f"- {value}")
-            if len(lines) == 3:
+            if not value or raw_line.strip().startswith("{") or re.match(r"(?i)^(as_of|date|日期|数据日期|来源日期|生成时间)\s*[:：=]", value):
+                continue
+            if re.fullmatch(r"(?:研究要点|研究摘要|研究日报|市场日报|A股联动日报)(?:\s*[（(].*[）)]|\s+\d{4}-\d{2}-\d{2})?", value):
+                continue
+            if name == "nng8" and re.match(r"^(?:数据|说明|数据说明|风险提示|风险|限制|注意事项|免责声明)[：:]|(?i:^research-data\s*快照\s*[：:])", value):
+                collecting = ""
+                rejected = bool(re.match(r"(?i)^research-data\s*快照\s*[：:]\s*(?:rejected|failed|invalid|未通过|拒绝)(?:\b|$)", value))
+                limited = bool(re.match(r"^(?:风险提示|风险|限制|注意事项|免责声明)[：:]", value)
+                               or re.search(r"部分可用|缺失|未验证|暂不采用|不完整|异常|失败", value))
+                priority = 0 if rejected else 1 if limited else 2
+                if not any(note == value for _, note in notes):
+                    notes.append((priority, value))
+                if rejected:
+                    self.issue(name, "invalid")
+                continue
+            section = research_section(value) if name == "nng8" else ""
+            bullet = bool(re.match(r"^\s*(?:[-*+]\s+|\d+[.)、]\s*)", raw_line))
+            if collecting and bullet and not section and blocks:
+                old_section, old = blocks[-1]
+                combined = old.rstrip("：:") + "；" + value
+                shortened |= len(combined) > MAX_TEXT
+                blocks[-1] = old_section, clean(combined)
+                continue
+            collecting = section if value.endswith(("：", ":")) and section else ""
+            if section == "market" and blocks and blocks[-1][0] == "market":
+                combined = blocks[-1][1] + "；" + value
+                shortened |= len(combined) > MAX_TEXT
+                blocks[-1] = "market", clean(combined)
+            elif (section, value) not in blocks:
+                blocks.append((section, value))
+        # Prefer one block from each labelled section over repeated market
+        # metrics. Unlabelled free text retains its original first-three order.
+        selected: list[int] = []
+        seen_sections: set[str] = set()
+        for index, (section, value) in enumerate(blocks):
+            if section and section not in seen_sections:
+                selected.append(index)
+                seen_sections.add(section)
+        selected = selected[:3]
+        for index in range(len(blocks)):
+            if len(selected) == 3:
                 break
-        if not lines:
+            if index not in selected:
+                selected.append(index)
+        lines = [f"- {blocks[index][1]}" for index in sorted(selected)]
+        if not blocks:
             self.issue(name, "schema_error")
-        return [self.highlight_heading(name)] + (lines or ["未知：未解析出有效要点。"])
+        # Rejection/limitations must survive a flood of ordinary source notes.
+        note_indexes = sorted(range(len(notes)), key=lambda index: (notes[index][0], index))[:3]
+        note_lines = [f"来源提示：{notes[index][1]}" for index in sorted(note_indexes)]
+        if len(notes) > 3:
+            self.issue(name, "truncated")
+            note_lines.append(f"来源提示：另有 {len(notes) - 3} 条说明未展示，已优先保留拒绝及限制提示。")
+        if shortened:
+            self.issue(name, "truncated")
+            note_lines.append("来源提示：部分段落或观察清单已截断，不能视为完整结论。")
+        return ([self.highlight_heading(name)] + (lines or ["未知：未解析出有效要点。"])
+                + note_lines)
 
     def highlight_heading(self, name: str) -> str:
         if f"{name}:stale" in self.issues:
             scope = "含过期历史内容，不作新增"
         elif any(f"{name}:{code}" in self.issues for code in ("future", "unknown_date", "invalid")):
-            scope = "日期未知或异常，不作新增"
+            scope = "内容或日期异常，不作新增"
         else:
             scope = "本次上报，非今日新增计数"
         return f"{LABELS[name]}（{scope}）："

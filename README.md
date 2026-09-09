@@ -109,3 +109,40 @@ records recovery silently. Normal days produce no extra Telegram message. The
 rollout does not fabricate a receipt for the legacy 09-08 message or resend it.
 Receipt checks are operational evidence, not tamper-proof verification against a
 compromised service account. Generated state and report files stay out of Git.
+
+## Producer-shaped digest adapters (2026-09-09)
+
+The renderer accepts editorial text from explicit top-level fields first, then
+from the item's `provenance` object: `title/note/reason/summary`, `source`, public
+`url/link/source_url`, and `published_at/timestamp/as_of/date`. Non-text values
+do not mask valid nested text; malformed provenance and publication dates retain
+quality warnings. A valid top-level publication date remains authoritative.
+`event_window.start/end` are signal windows, not news publication timestamps.
+Source-envelope date precedence and the existing 72-hour rule are unchanged;
+a fresh `produced_at` does not refresh an old `as_of`.
+
+All displayed nested fields use the existing bounded credential/link cleaning.
+Explicit simulation/probe metadata in provenance is also filtered, including
+known probe prefixes in `event_id`; ordinary headline text is not a probe flag.
+No arbitrary nested objects, private event identifiers, or inferred sentiment
+are rendered. Items retain upstream order and the existing three-item limit;
+this adapter is not news ranking or cross-day deduplication.
+
+For nng8 text/markdown, report titles no longer consume a summary slot. Adjacent
+market and turnover lines form one overview; a labelled watch list and its
+bullet children form one block. The renderer selects at most three blocks with
+labelled-section coverage, preserving source order, rather than discarding
+later sector/watch content. Unlabelled text keeps its first-three-line behavior.
+Source data notes and limitations are shown separately. An explicitly rejected,
+failed or invalid `research-data` snapshot sets the existing `nng8:invalid`
+quality code; its source warning must not disappear when shortening the report.
+Rejection, risk and limitation notes take precedence over ordinary source notes.
+Overflow and shortened long paragraphs/watch lists are explicitly labelled
+incomplete and set the existing `truncated` code; clipping must not imply a
+complete list or conclusion.
+
+The content regression suite includes synthetic, anonymized examples matching
+the actual producer field shapes. Raw production inputs, symbols, event IDs,
+private source routes and credentials are not copied into test fixtures. Run
+the same offline commands above. No approval, Quant, scheduler or delivery
+behavior is changed by this adapter.
