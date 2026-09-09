@@ -27,6 +27,7 @@
 !/tests/test_offline.py
 !/tests/test_digest_content.py
 !/tests/test_digest_delivery.py
+!/tests/test_sealed_research.py
 
 # Defense in depth for runtime material, including nested copies.
 **/*.env

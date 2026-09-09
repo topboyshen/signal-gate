@@ -140,9 +140,21 @@ def research_section(value: str) -> str:
     return ""
 
 
+def research_references(value: str) -> set[str]:
+    """Parse every reserved source marker; never ignore malformed/grouped refs."""
+    pattern = re.compile(r"\[来源\s*([1-9][0-9]*(?:(?:\s*[、,，]\s*|\s+)[1-9][0-9]*)*)\s*\]")
+    references: set[str] = set()
+    for match in pattern.finditer(value):
+        references.update(re.findall(r"[1-9][0-9]*", match[1]))
+    if "[来源" in pattern.sub("", value):
+        raise ValueError("invalid_source_reference")
+    return references
+
+
 class Renderer:
-    def __init__(self, base: Path, db_path: Path, now: datetime):
+    def __init__(self, base: Path, db_path: Path, now: datetime, *, require_sealed_research: bool = True):
         self.base, self.db_path, self.now = base.resolve(), db_path, now
+        self.require_sealed_research = require_sealed_research
         self.issues: list[str] = []
         self.sources: dict[str, dict] = {}
         self.pending_count: int | None = None
@@ -174,7 +186,10 @@ class Renderer:
     def source(self, name: str) -> tuple[dict | None, str]:
         folder = self.base / "inbox" / name
         raw = self.read(folder / "digest-latest.json", name)
-        md = self.read(folder / "digest-latest.md", name) if name != "quant" else None
+        # Strict research is JSON-only; an unrelated stale Markdown twin must
+        # neither supply content nor poison a valid sealed contract.
+        read_markdown = name != "quant" and not (name == "nng8" and self.require_sealed_research)
+        md = self.read(folder / "digest-latest.md", name) if read_markdown else None
         data = None
         if raw is not None:
             try:
@@ -204,7 +219,7 @@ class Renderer:
             status = "invalid" if supplied else "unknown_date"
         elif stamp > self.now:
             status = "future"
-        elif self.now - stamp > timedelta(hours=72):
+        elif self.now - stamp > timedelta(hours=72) and not (name == "nng8" and self.require_sealed_research):
             status = "stale"
         if status != "ok":
             self.issue(name, status)
@@ -215,7 +230,12 @@ class Renderer:
         return data, md or ""
 
     def highlights(self, name: str) -> list[str]:
+        if name == "nng8" and self.require_sealed_research and self.now.weekday() >= 5:
+            self.sources[name] = {"status": "not_scheduled", "as_of": None, "age_hours": None}
+            return ["研究：周末没有计划生成新研究，本栏不沿用旧稿。"]
         data, md = self.source(name)
+        if name == "nng8" and self.require_sealed_research:
+            return self.sealed_research(data)
         if data is None and not md:
             return [f"{LABELS[name]}：未知（缺报或内容无效）。"]
         if data and is_noise(data):
@@ -377,6 +397,120 @@ class Renderer:
             note_lines.append("来源提示：部分段落或观察清单已截断，不能视为完整结论。")
         return ([self.highlight_heading(name)] + (lines or ["未知：未解析出有效要点。"])
                 + note_lines)
+
+    def sealed_research(self, data: dict | None) -> list[str]:
+        """Require a completed current-day sealed-report relay, never old text.
+
+        Hashes here are provenance identifiers, not independent verification of
+        the remote files. The authenticated relay verifies the actual seal.
+        """
+        unavailable = ["研究：尚未收到当日通过校验的正式研究摘要；旧稿未纳入。"]
+        contract = data.get("research_contract") if isinstance(data, dict) else None
+        summary = data.get("research_summary") if isinstance(data, dict) else None
+        if not isinstance(contract, dict) or not isinstance(summary, dict):
+            self.issue("nng8", "missing")
+            return unavailable
+        try:
+            if is_noise(data):
+                raise ValueError
+            day = self.now.date().isoformat()
+            if (type(contract.get("version")) is not int or contract["version"] != 1
+                    or contract.get("status") != "ready" or data.get("source") != "nng8"
+                    or contract.get("report_date") != day or data.get("target_date") != day
+                    or contract.get("publication_gate") != "passed"
+                    or contract.get("evidence_review") != "passed"
+                    or contract.get("data_status") not in ("live", "partial")
+                    or contract.get("semantic_review") not in ("not_human_reviewed", "human_passed")):
+                raise ValueError
+            as_of = contract.get("as_of")
+            if not isinstance(as_of, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", as_of) is None:
+                raise ValueError
+            market = parse_date(as_of)
+            if market is None or market.date() >= self.now.date() or data.get("as_of") != as_of:
+                raise ValueError
+            # Validity of the actual previous session was checked by the sealed
+            # upstream report, not inferred using a weekday-only calendar here.
+            for key in ("report_sha256", "last_run_sha256", "context_sha256"):
+                value = contract.get(key)
+                if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                    raise ValueError
+            times = []
+            for value in (contract.get("completed_at"), data.get("produced_at")):
+                if not isinstance(value, str) or re.search(r"(?:Z|[+-]\d{2}:\d{2})$", value) is None:
+                    raise ValueError
+                stamp = parse_date(value)
+                if stamp is None or stamp.date() != self.now.date() or stamp > self.now:
+                    raise ValueError
+                times.append(stamp)
+            if times[0] > times[1]:
+                raise ValueError
+            def text_value(value):
+                if not isinstance(value, str) or not value.strip() or len(value) > 1200:
+                    raise ValueError
+                result = clean(value, 1200)
+                if not result:
+                    raise ValueError
+                return result
+            conclusion = text_value(summary.get("conclusion"))
+            if re.match(r"^(?:-\s*)?\[(?:事实|推断)\]\s*\S", conclusion) is None:
+                raise ValueError
+            parts = {}
+            for field in ("evidence", "counter_evidence", "risks", "sources", "limitations"):
+                values = summary.get(field)
+                if not isinstance(values, list) or len(values) > 24:
+                    raise ValueError
+                parts[field] = [text_value(value) for value in values]
+            if len(conclusion) + sum(len(v) for values in parts.values() for v in values) > 20000:
+                raise ValueError
+            if not parts["risks"] or not parts["limitations"] or not parts["sources"]:
+                raise ValueError
+            source_ids = set()
+            for entry in parts["sources"]:
+                match = re.fullmatch(r"(?:\[来源\s*([1-9][0-9]*)\]|([1-9][0-9]*)[.、])\s*(\S.*)", entry)
+                if match is None:
+                    raise ValueError
+                identifier = match[1] or match[2]
+                if identifier in source_ids:
+                    raise ValueError
+                source_ids.add(identifier)
+            referenced = research_references("\n".join(
+                [conclusion] + parts["evidence"] + parts["counter_evidence"]
+                + parts["risks"] + parts["limitations"]))
+            if not referenced or not referenced.issubset(source_ids):
+                raise ValueError
+            claim_references = research_references("\n".join([conclusion] + parts["evidence"]))
+            if not claim_references:
+                raise ValueError
+            counter_missing = False
+            if "[推断]" in conclusion:
+                if not parts["evidence"] or not parts["counter_evidence"]:
+                    raise ValueError
+                if any(not research_references(value) for value in parts["evidence"]):
+                    raise ValueError
+                for value in parts["counter_evidence"]:
+                    if research_references(value):
+                        continue
+                    if (re.match(r"^(?:-\s*)?\[推断\]\s*风险[：:]", conclusion) is None
+                            or re.fullmatch(r"(?:反证[：:]\s*)?未提供结构化反证来源，不升级为事实结论。", value) is None
+                            or len(parts["counter_evidence"]) != 1):
+                        raise ValueError
+                    counter_missing = True
+        except (TypeError, ValueError, KeyError, OverflowError):
+            self.issue("nng8", "invalid")
+            return unavailable + ["来源提示：研究日期、封存凭证或摘要结构未通过校验。"]
+        lines = [f"研究（报告日 {day}；行情截至 {as_of}；上游完成 {times[0].strftime('%H:%M')}）：", conclusion]
+        for key, label in (("evidence", "支持证据"), ("counter_evidence", "反证"),
+                           ("risks", "风险与数据缺口"), ("sources", "引用来源与时间"),
+                           ("limitations", "来源限制")):
+            if parts[key]:
+                lines.append(label + "：")
+                lines.extend("- " + value for value in parts[key])
+        lines.append("数据状态：" + ("部分可用" if contract["data_status"] == "partial" else "上游标记可用"))
+        lines.append("研究语义：" + ("未经人工审核" if contract["semantic_review"] == "not_human_reviewed" else "上游标记人工审核通过"))
+        if counter_missing:
+            lines.append("来源限制：该风险推断未提供可引用反证，固定缺失提示不代表反证已核验。")
+        lines.append("仅供研究核对，不构成审批、交易指令或已核验执行结果。")
+        return lines
 
     def highlight_heading(self, name: str) -> str:
         if f"{name}:stale" in self.issues:
@@ -571,16 +705,18 @@ class Renderer:
                     label = "无纳入记录"
                 lines.append(f"人审：只读快照；最新记录时间 {label}。")
             else:
-                lines.append(f"{LABELS[name]}：来源时间 {label}（北京时间）。")
+                lines.append("研究：周末未计划生成新研究。" if info["status"] == "not_scheduled"
+                             else f"{LABELS[name]}：来源时间 {label}（北京时间）。")
         if self.issues:
             lines.append("警示：" + "；".join(f"{LABELS[source]}{WARNINGS[code]}" for source, code in (item.split(":") for item in self.issues)) + "。")
         else:
-            lines.append("来源不超过72小时；前一自然日和周末日期按此阈值检查。")
+            lines.append("研究按当日报告校验，其余来源按72小时阈值检查。" if self.require_sealed_research
+                         else "来源不超过72小时；前一自然日和周末日期按此阈值检查。")
         lines.append("说明：过滤明确模拟标记和联调探针；其余内容不自动视为实盘。无持仓推断。")
         return {"report_date": self.now.date().isoformat(), "text": "\n".join(lines) + "\n", "issues": self.issues, "degraded": bool(self.issues), "sources": self.sources}
 
 
-def build_report(base: Path, db_path: Path, now: datetime | None = None) -> dict:
+def build_report(base: Path, db_path: Path, now: datetime | None = None, *, require_sealed_research: bool = True) -> dict:
     now = datetime.now(TZ) if now is None else now
     now = now.replace(tzinfo=TZ) if now.tzinfo is None else now.astimezone(TZ)
-    return Renderer(Path(base), Path(db_path), now).report()
+    return Renderer(Path(base), Path(db_path), now, require_sealed_research=require_sealed_research).report()

@@ -7,7 +7,7 @@ Minimal localhost HMAC receiver for pending A-share signals on dedirock.
 - Secrets: `/opt/signal-gate/secrets.env` (mode 600)
 - Data: `/opt/signal-gate/data/signals.db`
 - Digest out: `/opt/signal-gate/out/daily-YYYY-MM-DD.md`
-- Units: `signal-gate.service`, `signal-gate-digest.timer` (08:00 Asia/Shanghai)
+- Units: `signal-gate.service`, `signal-gate-digest.timer` (08:15 Asia/Shanghai)
 
 The existing HTTPS entry was explicitly approved on 2026-09-08. Its private
 routes remain outside this repository; the relay and included snippet are
@@ -30,6 +30,7 @@ Do not use `git add -f` to bypass that boundary.
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_offline.py' -v
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_digest_content.py' -v
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_digest_delivery.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_sealed_research.py' -v
 ```
 
 This suite uses temporary databases and artifacts, synthetic configuration, and
@@ -48,14 +49,16 @@ They require separate authorization for the exact live actions. See
 
 ## Digest schedule
 
-The timer specifies `OnCalendar=*-*-* 08:00:00 Asia/Shanghai`, so its calendar
+The timer specifies `OnCalendar=*-*-* 08:15:00 Asia/Shanghai`, so its calendar
 does not depend on the server's local timezone. `RandomizedDelaySec=30s`,
-`AccuracySec=1m` and `Persistent=true` are retained; execution may be delayed from
-08:00, and starting an overdue persistent timer can catch up a missed run.
+`AccuracySec=1m` are retained; execution may be delayed from 08:15.
+`Persistent=false` avoids catching up and sending an outdated morning report
+after a late reboot or a timer migration. A missed morning delivery is reported
+by the watchdog; it is not automatically resent in the afternoon.
 `Timezone=` is not a valid timer directive.
 
 ```bash
-systemd-analyze calendar '*-*-* 08:00:00 Asia/Shanghai'
+systemd-analyze calendar '*-*-* 08:15:00 Asia/Shanghai'
 ```
 
 This command only validates the calendar. Applying a changed unit requires a
@@ -73,7 +76,8 @@ The text distinguishes source dates from generation time, missing/invalid/stale
 data from confirmed zero, current unexpired pending items from history, and
 upstream acceptance from actual fills. Simulation filtering is shared by item
 counts and execution totals. A previous-day `as_of` is normal for a morning
-report; sources older than 72 hours, undated or future-dated are flagged.
+report. News/execution sources older than 72 hours, undated or future-dated are
+flagged. Research now uses the stricter same-day sealed contract below.
 
 `app/digest.py` is the delivery entry point. Its normal invocation sends; for
 inspection use only:
@@ -103,7 +107,7 @@ conservative mechanism does not claim absolute exactly-once delivery or that a
 human read the message. Manual resend/reconciliation requires explicit approval.
 
 The separate infra watchdog starts monitoring receipt-based delivery on
-2026-09-09, after the 08:10 deadline, with bounded morning rechecks. It alerts only
+2026-09-09, after the 08:25 deadline, with bounded morning rechecks. It alerts only
 for missing/failed/unknown delivery or degraded data, deduplicates an incident and
 records recovery silently. Normal days produce no extra Telegram message. The
 rollout does not fabricate a receipt for the legacy 09-08 message or resend it.
@@ -118,7 +122,7 @@ from the item's `provenance` object: `title/note/reason/summary`, `source`, publ
 do not mask valid nested text; malformed provenance and publication dates retain
 quality warnings. A valid top-level publication date remains authoritative.
 `event_window.start/end` are signal windows, not news publication timestamps.
-Source-envelope date precedence and the existing 72-hour rule are unchanged;
+For non-research sources, source-envelope date precedence and the 72-hour rule are unchanged;
 a fresh `produced_at` does not refresh an old `as_of`.
 
 All displayed nested fields use the existing bounded credential/link cleaning.
@@ -128,7 +132,7 @@ No arbitrary nested objects, private event identifiers, or inferred sentiment
 are rendered. Items retain upstream order and the existing three-item limit;
 this adapter is not news ranking or cross-day deduplication.
 
-For nng8 text/markdown, report titles no longer consume a summary slot. Adjacent
+For legacy nng8 text/markdown parser regression fixtures, report titles no longer consume a summary slot. Adjacent
 market and turnover lines form one overview; a labelled watch list and its
 bullet children form one block. The renderer selects at most three blocks with
 labelled-section coverage, preserving source order, rather than discarding
@@ -146,3 +150,35 @@ the actual producer field shapes. Raw production inputs, symbols, event IDs,
 private source routes and credentials are not copied into test fixtures. Run
 the same offline commands above. No approval, Quant, scheduler or delivery
 behavior is changed by this adapter.
+
+## Sealed research handoff (2026-09-09)
+
+The nnG8 source job runs on weekdays at 08:00 Shanghai. Its existing draft and
+notification chain stays intact. A successful draft/seal job additionally queues
+the research relay, with independent checks at 08:05 and 08:10. The relay validates
+today's completed occurrence, run gates, report bytes and seal hashes before
+reading the **formal report**, not the XHS draft body or old EOD template. Posting
+closes at 08:14, reserving time before the 08:15 merge; the relay unit is bounded
+to 45 seconds plus a 5-second stop allowance. The 08:25
+watchdog checks confirmed delivery and quality without extra healthy-day messages.
+
+Production requires `research_contract` version 1, ready status, today's report
+date, ordered timezone-aware completion time, passed publication/evidence gates,
+and the report/run/context hash identifiers. These identifiers are verified
+against artifacts by the authenticated relay; the receiver does not independently
+read nnG8 files. The market `as_of` stays the report's previous-session date; a
+Monday report may correctly reference Friday and is not rejected by a 72-hour
+shortcut. A fresh envelope cannot make yesterday's report current.
+
+`research_summary` retains the original fact/inference label, a complete selected
+analysis block, support, counterevidence, risks, referenced sources and limitations.
+Partial data and no human semantic review remain explicit. Missing evidence,
+unresolved references, oversized summaries and unvalidated old input fail closed.
+Missing/currently invalid research is shown as a gap, never silently replaced by
+legacy text or Markdown. Historical parsers remain testable through an internal
+opt-out used only by regression fixtures; no production CLI switch enables it.
+
+Weekends have no scheduled source and explicitly omit old research. A weekday
+non-trading-day skip is not yet transported as a separately validated skip
+contract; it is conservatively reported as missing, not assumed to be a holiday.
+No model call, approval, trading action or same-day resend is added by this change.

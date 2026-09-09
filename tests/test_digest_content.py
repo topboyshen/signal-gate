@@ -78,7 +78,9 @@ class DigestContentTests(unittest.TestCase):
              patch.object(sqlite3, "connect", side_effect=readonly_connect), \
              patch.object(socket, "socket", side_effect=AssertionError("network forbidden")) as sockets, \
              patch.object(urllib.request, "urlopen", side_effect=AssertionError("network forbidden")) as network:
-            report = content.build_report(self.base, self.db, now)
+            # Legacy input-format coverage remains explicit. Production uses the
+            # default sealed-research gate; see test_sealed_research.py.
+            report = content.build_report(self.base, self.db, now, require_sealed_research=False)
         sockets.assert_not_called()
         network.assert_not_called()
         self.assertIsInstance(report["degraded"], bool)

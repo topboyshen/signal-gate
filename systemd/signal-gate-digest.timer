@@ -1,11 +1,11 @@
 [Unit]
-Description=Run Signal Gate daily digest at 08:00 Asia/Shanghai
+Description=Run Signal Gate daily digest after sealed research at 08:15 Asia/Shanghai
 
 [Timer]
-OnCalendar=*-*-* 08:00:00 Asia/Shanghai
+OnCalendar=*-*-* 08:15:00 Asia/Shanghai
 RandomizedDelaySec=30s
 AccuracySec=1m
-Persistent=true
+Persistent=false
 Unit=signal-gate-digest.service
 
 [Install]
