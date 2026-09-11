@@ -42,6 +42,13 @@ NOISE_PREFIXES = (
     "selftest", "review-selftest", "e2e-forward", "nginx-probe", "curl-valid",
     "dedirock:probe", "test:", "research_eod:nng8:probe", "probe",
 )
+SYMBOL_RE = re.compile(r"\d{6}\.(?:SH|SZ|BJ)")
+INDEX_NAMES = {
+    "000001.SH": "上证指数", "000016.SH": "上证50", "000300.SH": "沪深300",
+    "000510.SH": "中证A500", "000688.SH": "科创50", "000852.SH": "中证1000",
+    "000905.SH": "中证500", "399001.SZ": "深证成指", "399005.SZ": "中小100",
+    "399006.SZ": "创业板指", "399300.SZ": "沪深300", "399673.SZ": "创业板50",
+}
 
 
 def safe_url(value: object) -> str:
@@ -149,6 +156,51 @@ def research_references(value: str) -> set[str]:
     if "[来源" in pattern.sub("", value):
         raise ValueError("invalid_source_reference")
     return references
+
+
+def instrument_kind(symbol: str) -> str:
+    if not symbol:
+        return "none"
+    if symbol in INDEX_NAMES:
+        return "index"
+    if SYMBOL_RE.fullmatch(symbol):
+        return "stock"
+    return "other"
+
+
+def display_instrument(symbol: str, name: str = "") -> str:
+    """Index → 指数名; stock with a local short name → '简称 代码'; otherwise keep the code."""
+    kind = instrument_kind(symbol)
+    if kind == "index":
+        return INDEX_NAMES[symbol]
+    label = clean(name, 12)
+    if kind == "stock" and label and label != symbol and not SYMBOL_RE.search(label):
+        return f"{label} {symbol}"
+    return symbol or "标的未知"
+
+
+def harvest_names(*texts: str) -> dict[str, str]:
+    names: dict[str, str] = {}
+    blob = "\n".join(texts)
+    for match in re.finditer(r"(\d{6}\.(?:SH|SZ|BJ))\s+([\u4e00-\u9fffA-Za-z0-9·]{2,10})", blob):
+        code, name = match.group(1), match.group(2)
+        if code in INDEX_NAMES or name in INDEX_NAMES.values():
+            continue
+        if name in {"方向未知", "偏多", "偏空", "通过", "拒绝"}:
+            continue
+        names.setdefault(code, name)
+    for match in re.finditer(r"([\u4e00-\u9fff]{2,8})\s+(\d{6}\.(?:SH|SZ|BJ))", blob):
+        name, code = match.group(1), match.group(2)
+        if code in INDEX_NAMES or name in INDEX_NAMES.values():
+            continue
+        names.setdefault(code, name)
+    return names
+
+
+def decorate_symbols(line: str, names: dict[str, str]) -> str:
+    def repl(match: re.Match[str]) -> str:
+        return display_instrument(match.group(0), names.get(match.group(0), ""))
+    return SYMBOL_RE.sub(repl, line)
 
 
 class Renderer:
@@ -275,7 +327,16 @@ class Renderer:
                     self.issue(name, "schema_error")
                     invalid_items += 1
                     continue
-                line = "｜".join(part for part in (symbol, side(item.get("side")) if symbol else "", title) if part)
+                kind = instrument_kind(symbol)
+                index_recap = bool(title and "上证指数" in title and "深证成指" in title and "收报" in title)
+                if index_recap or (kind == "index" and not title):
+                    continue
+                shown = display_instrument(
+                    symbol, first_text(item, ("name", "short_name", "sec_name"), 12),
+                ) if symbol else ""
+                if kind == "index":
+                    shown = INDEX_NAMES[symbol]
+                line = "｜".join(part for part in (shown, side(item.get("side")) if symbol and kind != "index" else "", title) if part)
                 # event_window is a signal-validity window, not publication time.
                 date_fields = ("published_at", "timestamp", "as_of", "date")
                 stamp = None
@@ -522,7 +583,7 @@ class Renderer:
         return f"{LABELS[name]}（{scope}）："
 
     def reviews(self) -> list[str]:
-        lines = ["【待审与既往人审】"]
+        lines = ["【人审（今日）】"]
         path = self.db_path
         try:
             if not path.resolve().is_relative_to(self.base) or path.is_symlink():
@@ -582,6 +643,9 @@ class Renderer:
                 filtered += 1
                 continue
             merged = {**body, **{key: value for key, value in row.items() if value is not None}}
+            symbol = clean(merged.get("symbol"), 24)
+            if instrument_kind(symbol) == "index":
+                continue
             receipt = parse_date(merged.get("received_at"), epoch=True)
             received.append(receipt if receipt and receipt <= self.now else None)
             decision = merged.get("decision")
@@ -597,11 +661,13 @@ class Renderer:
                 self.issue("review", "future")
             approved += decision == "approve"
             rejected += decision == "reject"
-            if decision in ("approve", "reject") and len(review_results) < 3:
+            reviewed_today = bool(review_time and review_time.date() == self.now.date())
+            if decision in ("approve", "reject") and reviewed_today and len(review_results) < 3:
                 state = "通过" if decision == "approve" else "拒绝"
                 quant = merged.get("quant_status")
                 delivered = "已提交/受理，非成交" if quant in ("ok", "accepted", "submitted") else "投递失败" if quant in ("failed", "error") else "未提交（已过期）" if quant == "skipped_expired" else "执行结果未知"
-                review_results.append(f"- {clean(merged.get('symbol'), 24) or '标的未知'}｜{state}｜{delivered}")
+                shown = display_instrument(symbol, first_text(merged, ("name", "short_name"), 12))
+                review_results.append(f"- {shown}｜{state}｜{delivered}")
             if merged.get("review_status") == "pending" and decision not in ("approve", "reject"):
                 expiry = parse_date(merged.get("expires_at"))
                 if expiry is None:
@@ -626,9 +692,12 @@ class Renderer:
             pending_line = f"{prefix}已确认有效待审 {len(valid)} 条；另有 {unknown_status} 条状态不明，总量未知；已过期 {expired} 条、有效期未知 {unknown} 条。"
         lines += [pending_line, f"今日新增 {today_received} 条；今日审核 {today_reviewed} 条。", f"累计（{scope}）：通过 {approved} 条 / 拒绝 {rejected} 条；过滤模拟/探针 {filtered} 条。"]
         for item, expiry in valid[:3]:
-            lines.append(f"- {clean(item.get('symbol'), 24) or '标的未知'}｜{side(item.get('side'))}｜有效至 {expiry.strftime('%Y-%m-%d %H:%M')}")
+            shown = display_instrument(
+                clean(item.get("symbol"), 24), first_text(item, ("name", "short_name"), 12),
+            )
+            lines.append(f"- {shown}｜{side(item.get('side'))}｜有效至 {expiry.strftime('%Y-%m-%d %H:%M')}")
         if review_results:
-            lines += ["既往审核结果（非今日新增）："] + review_results
+            lines += ["今日审核结果："] + review_results
         last = max(stamps) if stamps else None
         self.sources["review"] = {"status": "ok", "as_of": last.isoformat() if last else None, "age_hours": None, "record_count": min(len(rows), MAX_ROWS) - filtered}
         return lines
@@ -684,6 +753,27 @@ class Renderer:
         review = self.reviews()
         research, news = self.highlights("nng8"), self.highlights("jd")
         execution = self.execution()
+        names = harvest_names(*research, *news, *review)
+        research = [decorate_symbols(line, names) for line in research]
+        news = [decorate_symbols(line, names) for line in news]
+        review = [decorate_symbols(line, names) for line in review]
+        execution = [decorate_symbols(line, names) for line in execution]
+        joined_execution = "\n".join(execution)
+        if ("所报执行为模拟/探针" in joined_execution
+                or "受理 0 / 提交 0 / 拒绝 0 / 上报成交 0 / 状态未知 0" in joined_execution):
+            execution = []
+
+        nng8 = self.sources.get("nng8") or {}
+        research_stamp = parse_date(nng8.get("as_of"))
+        if nng8.get("status") == "not_scheduled":
+            research_day = "周末无新研究"
+        elif "nng8:missing" in self.issues:
+            research_day = "缺报"
+        elif nng8.get("status") == "ok" and research_stamp:
+            research_day = research_stamp.strftime("%Y-%m-%d")
+        else:
+            research_day = "未通过校验"
+
         attention = []
         if self.pending_count:
             attention.append(f"优先核对 {self.pending_count} 条仍在有效期内的待审。")
@@ -692,7 +782,15 @@ class Renderer:
         else:
             attention.append("当前有效待审总量未知，请先核对数据。")
         attention.append("部分来源缺报、过期或不完整，先核对末尾警示。" if self.issues else "来源日期检查通过；以下仅供核对，不代表交易指令。")
-        lines = [f"A股联动日报 {self.now.date().isoformat()}", f"生成 {self.now.strftime('%H:%M')}（北京时间）", "", "【今日关注】", *attention, "", "【新研究与资讯】", *research, *news, "", *review, "", *execution, "", "【来源日期与警示】"]
+        lines = [
+            f"A股联动日报 {self.now.date().isoformat()}",
+            f"生成 {self.now.strftime('%H:%M')}（北京时间）｜研报日 {research_day}",
+            "", "【今日关注】", *attention, "",
+            "【研究】", *research, "", "【资讯】", *news, "", *review,
+        ]
+        if execution:
+            lines += ["", *execution]
+        lines += ["", "【来源日期与警示】"]
         for name in ("nng8", "jd", "quant", "review"):
             info = self.sources[name]
             source_issues = [item.split(":")[1] for item in self.issues if item.startswith(name + ":")]
@@ -705,14 +803,18 @@ class Renderer:
                     label = "无纳入记录"
                 lines.append(f"人审：只读快照；最新记录时间 {label}。")
             else:
-                lines.append("研究：周末未计划生成新研究。" if info["status"] == "not_scheduled"
-                             else f"{LABELS[name]}：来源时间 {label}（北京时间）。")
+                if name == "nng8" and info["status"] == "not_scheduled":
+                    lines.append("研究：周末未计划生成新研究。")
+                elif name == "nng8" and "nng8:missing" in self.issues:
+                    lines.append("研究：当日密封摘要缺报，旧稿未纳入。")
+                else:
+                    lines.append(f"{LABELS[name]}：来源时间 {label}（北京时间）。")
         if self.issues:
             lines.append("警示：" + "；".join(f"{LABELS[source]}{WARNINGS[code]}" for source, code in (item.split(":") for item in self.issues)) + "。")
         else:
             lines.append("研究按当日报告校验，其余来源按72小时阈值检查。" if self.require_sealed_research
                          else "来源不超过72小时；前一自然日和周末日期按此阈值检查。")
-        lines.append("说明：过滤明确模拟标记和联调探针；其余内容不自动视为实盘。无持仓推断。")
+        lines.append("说明：缺报不沿用旧稿；指数不作为个股；过滤模拟/探针。不构成交易指令。")
         return {"report_date": self.now.date().isoformat(), "text": "\n".join(lines) + "\n", "issues": self.issues, "degraded": bool(self.issues), "sources": self.sources}
 
 

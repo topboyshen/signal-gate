@@ -455,7 +455,8 @@ class DigestContentTests(unittest.TestCase):
         text = self.render()["text"]
         self.assertIn("今日新增 0 条；今日审核 0 条", text)
         self.assertIn("累计（全部本地留存）：通过 1 条", text)
-        self.assertIn("已提交/受理，非成交", text)
+        self.assertNotIn("今日审核结果：", text)
+        self.assertNotIn("600000.SH｜通过", text)
 
     def test_missing_columns_do_not_claim_zero_or_break_other_sections(self):
         self.db.parent.mkdir(parents=True)
@@ -611,6 +612,69 @@ class DigestContentTests(unittest.TestCase):
         self.assertIn("quant:schema_error", report["issues"])
         self.assertIn("valid", report["text"])
         self.assertIn("状态未知 2", report["text"])
+
+    def test_index_codes_are_not_listed_as_stocks(self):
+        self.complete()
+        self.source("jd", {"as_of": "2026-09-07", "items": [
+            {"symbol": "000300.SH", "side": "long"},
+            {"symbol": "399006.SZ", "side": "short", "title": "指数层面事件"},
+            {"symbol": "600000.SH", "name": "浦发银行", "title": "个股新闻"},
+        ]})
+        text = self.render()["text"]
+        self.assertNotIn("000300.SH", text)
+        self.assertNotIn("399006.SZ", text)
+        self.assertIn("创业板指", text)
+        self.assertIn("指数层面事件", text)
+        self.assertIn("浦发银行 600000.SH", text)
+        self.assertIn("个股新闻", text)
+        self.source("jd", {"as_of": "2026-09-07", "items": [
+            {"symbol": "000300.SH",
+             "title": "上证指数早盘收报3937点，跌0.35%。 深证成指早盘收报13647点，跌0.55%。"},
+            {"symbol": "000688.SH", "title": "科创50ETF吸金47亿"},
+        ]})
+        recap = self.render()["text"]
+        self.assertNotIn("早盘收报3937", recap)
+        self.assertIn("科创50ETF吸金47亿", recap)
+
+    def test_research_watch_line_keeps_local_name(self):
+        self.complete()
+        text = "\n".join([
+            "大盘：上证指数 +0.07%。", "板块：元件走强。",
+            "观察标的：", "- 002617.SZ 露笑科技 昨收 +0.33%",
+        ])
+        self.source("nng8", {"source": "nng8", "as_of": "2026-09-07", "text": text,
+                             "produced_at": "2026-09-08T07:40:00+08:00"})
+        report = self.render()
+        self.assertIn("露笑科技 002617.SZ", report["text"])
+
+    def test_index_review_rows_are_ignored(self):
+        self.complete()
+        self.row("idx", symbol="399006.SZ", review_status="reviewed", decision="approve",
+                 received_at=int(NOW.timestamp()), reviewed_at=int(NOW.timestamp()))
+        self.row("stock", symbol="600000.SH", review_status="reviewed", decision="approve",
+                 received_at=int(NOW.timestamp()), reviewed_at=int(NOW.timestamp()),
+                 quant_status="accepted")
+        text = self.render()["text"]
+        self.assertNotIn("399006.SZ", text)
+        self.assertNotIn("创业板指｜通过", text)
+        self.assertIn("今日审核结果：", text)
+        self.assertIn("600000.SH｜通过", text)
+        self.assertIn("累计（全部本地留存）：通过 1 条", text)
+
+    def test_header_names_research_day_and_sealed_missing_keeps_old_text_out(self):
+        self.database()
+        md = self.base / "inbox" / "nng8" / "digest-latest.md"
+        md.parent.mkdir(parents=True, exist_ok=True)
+        md.write_text("大盘：上证指数 +0.07%；露笑科技不应出现\n", encoding="utf-8")
+        self.source("jd", {"as_of": "2026-09-07", "items": [{"title": "有效资讯"}]})
+        self.source("quant", {"as_of": "2026-09-07", "items": []})
+        report = content.build_report(self.base, self.db, NOW, require_sealed_research=True)
+        self.assertIn("研报日 缺报", report["text"])
+        self.assertIn("旧稿未纳入", report["text"])
+        self.assertNotIn("上证指数 +0.07%", report["text"])
+        self.assertNotIn("露笑科技不应出现", report["text"])
+        self.assertIn("有效资讯", report["text"])
+        self.assertIn("nng8:missing", report["issues"])
 
 
 if __name__ == "__main__":
