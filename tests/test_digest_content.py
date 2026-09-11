@@ -678,6 +678,30 @@ class DigestContentTests(unittest.TestCase):
         self.assertIn("有效资讯", report["text"])
         self.assertIn("nng8:missing", report["issues"])
 
+    def test_similar_historical_headlines_are_deduplicated(self):
+        self.complete()
+        self.source("jd", {"as_of": "2026-09-07", "items": [
+            {"symbol": "399006.SZ", "title": "收评：创业板指冲高回落跌超1% 农业板块逆势走强"},
+            {"symbol": "399006.SZ", "title": "A股收盘：创业板指震荡跌超1%，农业股逆势爆发"},
+            {"symbol": "399006.SZ", "title": "9月8日收评：创业板指震荡跌超1%，农业股逆势爆发"},
+            {"symbol": "000688.SH", "title": "科创50ETF近5日吸金47亿"},
+        ]})
+        text = self.render()["text"]
+        self.assertEqual(text.count("创业板指震荡跌超1%"), 1)
+        self.assertIn("科创50ETF近5日吸金47亿", text)
+
+    def test_execution_drops_index_rows_from_counts_and_details(self):
+        self.complete()
+        self.source("quant", {"as_of": "2026-09-07", "items": [
+            {"symbol": "399006.SZ", "status": "accepted"},
+            {"symbol": "600000.SH", "status": "accepted"},
+        ]})
+        text = self.render()["text"]
+        self.assertIn("受理 1 /", text)
+        self.assertIn("600000.SH", text)
+        self.assertNotIn("创业板指｜受理", text)
+        self.assertNotIn("399006.SZ", text)
+
 
 if __name__ == "__main__":
     unittest.main()

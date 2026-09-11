@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 import ipaddress
 import json
 from pathlib import Path
@@ -203,6 +204,17 @@ def decorate_symbols(line: str, names: dict[str, str]) -> str:
     return SYMBOL_RE.sub(repl, line)
 
 
+def similar_news_title(left: str, right: str) -> bool:
+    """Treat near-duplicate headlines as one item; exact containment or high overlap."""
+    a = re.sub(r"\s+", "", left)
+    b = re.sub(r"\s+", "", right)
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    return SequenceMatcher(None, a, b).ratio() >= 0.72
+
+
 class Renderer:
     def __init__(self, base: Path, db_path: Path, now: datetime, *, require_sealed_research: bool = True):
         self.base, self.db_path, self.now = base.resolve(), db_path, now
@@ -303,6 +315,7 @@ class Renderer:
                 break
         if items is not None:
             kept, filtered, invalid_items = [], 0, 0
+            seen_titles: list[str] = []
             for item in items[:MAX_ROWS]:
                 if isinstance(item, str):
                     item = {"title": item}
@@ -331,6 +344,10 @@ class Renderer:
                 index_recap = bool(title and "上证指数" in title and "深证成指" in title and "收报" in title)
                 if index_recap or (kind == "index" and not title):
                     continue
+                if name == "jd" and title:
+                    if any(similar_news_title(title, old) for old in seen_titles):
+                        continue
+                    seen_titles.append(title)
                 shown = display_instrument(
                     symbol, first_text(item, ("name", "short_name", "sec_name"), 12),
                 ) if symbol else ""
@@ -723,6 +740,9 @@ class Renderer:
                 if is_noise(item):
                     filtered += 1
                     continue
+                symbol = clean(item.get("symbol"), 24)
+                if instrument_kind(symbol) == "index":
+                    continue
                 status = item.get("status")
                 key = status if status in ("accepted", "submitted", "rejected", "filled") else "unknown"
                 if key == "unknown" and not isinstance(status, (str, type(None))):
@@ -730,7 +750,7 @@ class Renderer:
                 counts[key] += 1
                 if len(details) < 3:
                     label = {"accepted": "受理（非成交）", "submitted": "提交（非成交）", "rejected": "拒绝", "filled": "上报成交（未核验）", "unknown": "状态未知"}[key]
-                    details.append(f"- {clean(item.get('symbol'), 24) or '标的未知'}｜{label}")
+                    details.append(f"- {display_instrument(symbol) or '标的未知'}｜{label}")
             if len(data["items"]) > MAX_ROWS:
                 self.issue("quant", "truncated")
             lines.append("范围：本次所报明细（非今日新增或历史全量）；来源性质未独立核实。")
