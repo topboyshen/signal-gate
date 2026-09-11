@@ -670,6 +670,8 @@ class DigestContentTests(unittest.TestCase):
         self.source("quant", {"as_of": "2026-09-07", "items": []})
         report = content.build_report(self.base, self.db, NOW, require_sealed_research=True)
         self.assertIn("研报日 缺报", report["text"])
+        self.assertIn("今日：待审 0 · 研报日 缺报", report["text"])
+        self.assertNotIn("不代表缺报来源没有新内容", report["text"])
         self.assertIn("旧稿未纳入", report["text"])
         self.assertNotIn("上证指数 +0.07%", report["text"])
         self.assertNotIn("露笑科技不应出现", report["text"])

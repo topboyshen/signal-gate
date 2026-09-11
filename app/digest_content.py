@@ -774,18 +774,18 @@ class Renderer:
         else:
             research_day = "未通过校验"
 
-        attention = []
         if self.pending_count:
-            attention.append(f"优先核对 {self.pending_count} 条仍在有效期内的待审。")
+            today = f"今日：待审 {self.pending_count} · 研报日 {research_day}"
         elif self.pending_count == 0:
-            attention.append("当前有效待审为0；不代表缺报来源没有新内容。")
+            today = f"今日：待审 0 · 研报日 {research_day}"
         else:
-            attention.append("当前有效待审总量未知，请先核对数据。")
-        attention.append("部分来源缺报、过期或不完整，先核对末尾警示。" if self.issues else "来源日期检查通过；以下仅供核对，不代表交易指令。")
+            today = f"今日：有效待审总量未知，请先核对数据。研报日 {research_day}"
+        if "jd:missing" in self.issues:
+            today += " · 资讯缺报"
         lines = [
             f"A股联动日报 {self.now.date().isoformat()}",
             f"生成 {self.now.strftime('%H:%M')}（北京时间）｜研报日 {research_day}",
-            "", "【今日关注】", *attention, "",
+            "", "【今日关注】", today, "",
             "【研究】", *research, "", "【资讯】", *news, "", *review,
         ]
         if execution:
