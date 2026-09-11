@@ -174,6 +174,14 @@ class OfflineTests(unittest.TestCase):
         with sqlite3.connect(self.db) as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM pending_signals").fetchone()[0], 0)
 
+    def test_auth_failure_logs_reason_without_secret(self):
+        self.assertEqual(self.pending(bad_signature=True)[0], 401)
+        self.server.log.warning.assert_called()
+        rendered = " ".join(str(part) for part in self.server.log.warning.call_args.args)
+        self.assertIn("bad_signature", rendered)
+        self.assertIn("jd", rendered)
+        self.assertNotIn(self.secret, rendered)
+
     def test_review_actor_denied_before_business_state_changes(self):
         _, inserted = self.pending()
         result = self.review_callback(self.callback(inserted["id"], actor="202"))

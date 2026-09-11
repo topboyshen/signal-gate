@@ -114,6 +114,14 @@ def init_db(db_path: Path) -> None:
         conn.commit()
 
 
+def safe_source_label(value: str) -> str:
+    """Loggable source token only; never echo signatures or raw headers."""
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+    if value and 0 < len(value) <= 32 and all(char in allowed for char in value):
+        return value
+    return "invalid"
+
+
 def verify_hmac(secret: str, timestamp: str, raw_body: bytes, signature: str) -> bool:
     if not signature.startswith("sha256="):
         return False
@@ -279,25 +287,31 @@ class Handler(BaseHTTPRequestHandler):
         source = (self.headers.get("X-Source") or "").strip()
         timestamp = (self.headers.get("X-Timestamp") or "").strip()
         signature = (self.headers.get("X-Signature") or "").strip()
+        path = urlparse(self.path).path
+
+        def reject(error: str):
+            log.warning(
+                "auth_failed path=%s error=%s source=%s ts_digits=%s sig=%s body=%s",
+                path, error, safe_source_label(source),
+                str(timestamp).isdigit(), bool(signature.startswith("sha256=")), length,
+            )
+            self._send(401, {"error": error})
+            return None, None
+
         secret_key = SOURCE_SECRET_KEYS.get(source)
         if not secret_key or secret_key not in self.secrets:
-            self._send(401, {"error": "bad_source"})
-            return None, None
+            return reject("bad_source")
         secret = self.secrets[secret_key]
         if not secret:
-            self._send(401, {"error": "bad_source"})
-            return None, None
+            return reject("bad_source")
         try:
             ts = int(timestamp)
         except ValueError:
-            self._send(401, {"error": "bad_timestamp"})
-            return None, None
+            return reject("bad_timestamp")
         if abs(int(time.time()) - ts) > MAX_SKEW_SEC:
-            self._send(401, {"error": "timestamp_skew"})
-            return None, None
+            return reject("timestamp_skew")
         if not verify_hmac(secret, timestamp, raw_body, signature):
-            self._send(401, {"error": "bad_signature"})
-            return None, None
+            return reject("bad_signature")
         return source, raw_body
 
     def do_POST(self) -> None:  # noqa: N802
