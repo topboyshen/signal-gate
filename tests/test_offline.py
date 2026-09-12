@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import importlib.util
@@ -28,8 +29,8 @@ def load_source(name: str):
     spec = importlib.util.spec_from_file_location(
         f"signal_gate_offline_{name}", PROJECT / "app" / f"{name}.py"
     )
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
@@ -115,21 +116,22 @@ class OfflineTests(unittest.TestCase):
             "provenance": {"fixture": True}, "review_status": "pending",
         }
 
-    def pending(self, body=None, *, bad_signature=False, timestamp=None):
+    def pending(self, body=None, *, bad_signature=False, timestamp=None,
+                path="/hooks/v1/pending-signals", source="jd"):
         raw = json.dumps(self.body() if body is None else body).encode()
         stamp = str(int(time.time()) if timestamp is None else timestamp)
         signature = "sha256=" + hmac.new(
             self.secret.encode(), stamp.encode() + b"." + raw, hashlib.sha256
         ).hexdigest()
         handler = object.__new__(self.server.Handler)
-        handler.path = "/hooks/v1/pending-signals"
+        handler.path = path
         handler.headers = {
             "Content-Type": "application/json", "Content-Length": str(len(raw)),
-            "X-Source": "jd", "X-Timestamp": stamp,
+            "X-Source": source, "X-Timestamp": stamp,
             "X-Signature": "sha256=" + "0" * 64 if bad_signature else signature,
         }
         handler.rfile = io.BytesIO(raw)
-        handler.secrets = {"HMAC_SECRET_JD": self.secret}
+        handler.secrets = {"HMAC_SECRET_" + source.upper(): self.secret}
         handler.db_path = self.db
         handler._send = Mock()
         handler.do_POST()
@@ -148,6 +150,72 @@ class OfflineTests(unittest.TestCase):
         return self.review.handle_callback(
             "offline-token", callback, self.actor, set(), self.quant_cfg
         )
+
+    def test_digest_drop_records_receiver_time_not_sender_claim(self):
+        body = {"as_of": "2026-09-07", "items": [{"title": "合成资讯"}],
+                "received_at": "2000-01-01T00:00:00Z"}
+        now = datetime(2026, 9, 8, 0, 14, tzinfo=timezone.utc)
+        with patch.object(self.server.news_history, "utc_now", return_value=now):
+            status, result = self.pending(body, path="/hooks/v1/digest-drop")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["received_at"], now.isoformat())
+        raw = json.dumps(body).encode()
+        self.assertEqual(result["body_sha256"], hashlib.sha256(raw).hexdigest())
+        folder = self.root / "inbox/jd"
+        self.assertEqual((folder/"digest-latest.json").read_bytes(), raw)
+        self.assertEqual(len(list((folder/"received").glob("*.json"))), 1)
+        self.notify.assert_not_called()
+        self.quant.assert_not_called()
+
+    def test_bad_digest_hmac_or_schema_never_creates_receipt(self):
+        body = {"as_of": "2026-09-07", "items": []}
+        self.assertEqual(self.pending(body, path="/hooks/v1/digest-drop", bad_signature=True)[0], 401)
+        self.assertEqual(self.pending(body, path="/hooks/v1/digest-drop", timestamp=1)[0], 401)
+        self.assertEqual(self.pending([], path="/hooks/v1/digest-drop")[0], 422)
+        self.assertFalse((self.root / "inbox").exists())
+        self.notify.assert_not_called()
+
+    def test_digest_storage_failure_is_not_acknowledged(self):
+        with patch.object(self.server.news_history, "capture", side_effect=OSError("synthetic failure")):
+            status, result = self.pending({"as_of": "2026-09-07"}, path="/hooks/v1/digest-drop")
+        self.assertEqual((status, result), (500, {"error": "storage_unavailable"}))
+        self.notify.assert_not_called()
+
+    def test_pending_aliases_cannot_forge_reception_evidence(self):
+        for key in ("../jd/received/fake", "/outside", "x\\y", "digest-latest",
+                    "digest-latest.receipt", "\ud800"):
+            with self.subTest(key_kind=repr(key)):
+                self.assertEqual(self.pending(self.body(key))[0], 422)
+        self.assertFalse((self.root / "inbox").exists())
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM pending_signals").fetchone()[0], 0)
+        self.notify.assert_not_called()
+
+    def test_digest_day_is_a_safe_alias_not_an_arbitrary_path(self):
+        self.assertEqual(self.pending({"as_of": "../../outside"}, path="/hooks/v1/digest-drop")[0], 422)
+        status, result = self.pending({"as_of": "2026-09-07/../../outside"}, path="/hooks/v1/digest-drop")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["day"], "2026-09-07")
+        self.assertEqual(Path(result["path"]), self.root/"inbox/jd/digest-2026-09-07.json")
+
+    def test_nng8_digest_uses_unchanged_hmac_and_no_jd_history(self):
+        status, _ = self.pending({"as_of": "2026-09-07", "text": "合成研究"},
+                                 path="/hooks/v1/digest-drop", source="nng8")
+        self.assertEqual(status, 200)
+        self.assertTrue((self.root/"inbox/nng8/digest-latest.json").is_file())
+        self.assertFalse((self.root/"inbox/jd").exists())
+        self.notify.assert_not_called()
+
+    def test_delivery_code_version_includes_news_history_helper(self):
+        baseline = self.digest.code_version()
+        original = Path.read_bytes
+
+        def changed_helper(path):
+            raw = original(path)
+            return raw + b"\n# synthetic helper revision\n" if path.name == "news_history.py" else raw
+
+        with patch.object(Path, "read_bytes", changed_helper):
+            self.assertNotEqual(self.digest.code_version(), baseline)
 
     def test_hmac_binds_timestamp_and_body(self):
         raw, stamp = b'{"fixture":true}', "1000"

@@ -1,5 +1,5 @@
 """Synthetic fixtures only; renderer reads are constrained to each temporary tree."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
 import io
@@ -110,7 +110,8 @@ class DigestContentTests(unittest.TestCase):
         self.assertFalse(report["degraded"])
         self.assertIn("当前有效待审 0 条", report["text"])
         self.assertIn("本次上报0条", report["text"])
-        self.assertIn("2026-09-07 00:00", report["text"])
+        self.assertIn("数据日期 2026-09-07（未提供时分）", report["text"])
+        self.assertNotIn("2026-09-07 00:00", report["text"])
 
     def test_stale_2000_not_hidden_by_fresh_mtime_or_generated_time(self):
         self.complete()
@@ -251,7 +252,10 @@ class DigestContentTests(unittest.TestCase):
                     {"provenance": {"title": "带日期的合成新闻", "published_at": published}},
                 ]})
                 report = self.render()
-                self.assertIn("带日期的合成新闻", report["text"])
+                if expected == "future":
+                    self.assertNotIn("带日期的合成新闻", report["text"])
+                else:
+                    self.assertIn("带日期的合成新闻", report["text"])
                 self.assertIn(f"jd:{expected}", report["issues"])
 
     def test_jd_nested_text_source_and_links_keep_existing_redaction(self):
@@ -779,7 +783,7 @@ class DigestContentTests(unittest.TestCase):
                 bad = {"title": "共同标题", "published_at": published}
                 self.source("jd", {"as_of": "2026-09-07", "items": [good, bad, bad]})
                 report = self.render()
-                self.assertEqual(report["text"].count("共同标题"), 2)
+                self.assertEqual(report["text"].count("共同标题"), 1 if issue == "future" else 2)
                 self.assertIn("jd:" + issue, report["issues"])
 
     def test_duplicate_news_does_not_hide_input_truncation(self):
@@ -790,6 +794,53 @@ class DigestContentTests(unittest.TestCase):
         report = self.render()
         self.assertEqual(report["text"].count("重复合成新闻"), 1)
         self.assertIn("jd:truncated", report["issues"])
+
+    def test_naive_news_envelope_time_is_not_assumed_to_be_shanghai(self):
+        self.complete()
+        self.source("jd", {"as_of": "2026-09-07T23:00:00", "items": [{"title": "来源时区未知"}]})
+        report = self.render()
+        self.assertIn("jd:invalid", report["issues"])
+        self.assertIsNone(report["sources"]["jd"]["as_of"])
+        self.assertNotIn("来源时间 2026-09-07 23:00", report["text"])
+
+    def test_news_times_show_unknowns_without_guessing_from_as_of_or_sender(self):
+        self.complete()
+        self.source("jd", {"as_of": "2026-09-07", "received_at": NOW.isoformat(),
+                           "items": [{"title": "发布时间缺失"}]})
+        report = self.render()
+        self.assertIn("发布时间未知", report["text"])
+        self.assertIn("本机接收 未知（无匹配收件记录）", report["text"])
+        self.assertIsNone(report["sources"]["jd"]["received_at"])
+
+    def test_verified_news_receipt_is_shown_without_touching_it(self):
+        self.complete()
+        raw = json.dumps({"as_of": "2026-09-07", "items": [{"title": "已留痕资讯"}]}).encode()
+        received = NOW.astimezone(timezone.utc)-timedelta(minutes=1)
+        with patch.object(content.news_history, "utc_now", return_value=received):
+            content.news_history.capture(self.base, raw, "2026-09-07")
+        before = {str(p): p.read_bytes() for p in (self.base/"inbox/jd").rglob("*") if p.is_file()}
+        report = self.render()
+        self.assertIn("本机接收 2026-09-08 07:59:00（北京时间）", report["text"])
+        self.assertEqual(report["sources"]["jd"]["receipt_status"], "verified")
+        self.assertEqual(before, {str(p): p.read_bytes() for p in (self.base/"inbox/jd").rglob("*") if p.is_file()})
+
+    def test_future_received_batch_cannot_be_rendered_as_earlier_knowledge(self):
+        self.complete()
+        raw = json.dumps({"as_of": "2026-09-07", "items": [{"title": "稍后才收到不得展示"}]}).encode()
+        with patch.object(content.news_history, "utc_now", return_value=NOW.astimezone(timezone.utc)+timedelta(seconds=1)):
+            content.news_history.capture(self.base, raw, "2026-09-07")
+        report = self.render()
+        self.assertNotIn("稍后才收到不得展示", report["text"])
+        self.assertIn("jd:future", report["issues"])
+
+    def test_received_json_cannot_borrow_unrelated_markdown(self):
+        self.complete()
+        path = self.source("jd", {"as_of": "2026-09-07"})
+        path.with_suffix(".md").write_text("旧的MARKDOWN不得借用", encoding="utf-8")
+        for raw in (b'{"as_of":"2026-09-07"}', b'{not-json}', b'x' * (content.MAX_INPUT + 1)):
+            with self.subTest(size=len(raw)):
+                path.write_bytes(raw)
+                self.assertNotIn("旧的MARKDOWN不得借用", self.render()["text"])
 
     def test_execution_drops_index_rows_from_counts_and_details(self):
         self.complete()

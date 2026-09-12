@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.util
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import sqlite3
 import sys
 import threading
 import time
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty, Queue
@@ -18,6 +20,11 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+_history_spec = importlib.util.spec_from_file_location("receiver_news_history", Path(__file__).with_name("news_history.py"))
+assert _history_spec is not None and _history_spec.loader is not None
+news_history = importlib.util.module_from_spec(_history_spec)
+_history_spec.loader.exec_module(news_history)
 
 BASE = Path(os.environ.get("SIGNAL_GATE_HOME", "/opt/signal-gate"))
 DB_PATH = Path(os.environ.get("SIGNAL_GATE_DB", str(BASE / "data" / "signals.db")))
@@ -251,8 +258,8 @@ class Handler(BaseHTTPRequestHandler):
     secrets: dict[str, str] = {}
     db_path: Path = DB_PATH
 
-    def log_message(self, fmt: str, *args: Any) -> None:
-        log.info("%s - %s", self.address_string(), fmt % args)
+    def log_message(self, format: str, *args: Any) -> None:
+        log.info("%s - %s", self.address_string(), format % args)
 
     def _send(self, code: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -324,7 +331,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         source, raw_body = self._auth_body()
-        if source is None:
+        if source is None or raw_body is None:
             return
 
         try:
@@ -345,7 +352,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         idem = data.get("idempotency_key")
-        if not isinstance(idem, str) or not idem.strip():
+        if (not isinstance(idem, str) or not idem.strip() or not idem.isprintable()
+                or idem.strip().lower().startswith("digest-")
+                or len(idem.encode("utf-8")) > 240
+                or any(char in idem for char in ("/", "\\", "\x00"))):
             self._send(422, {"error": "bad_idempotency_key"})
             return
 
@@ -377,7 +387,9 @@ class Handler(BaseHTTPRequestHandler):
                         now,
                     ),
                 )
-                row_id = int(cur.lastrowid)
+                if cur.lastrowid is None:
+                    raise sqlite3.DatabaseError("missing inserted row id")
+                row_id = cur.lastrowid
                 conn.commit()
         except sqlite3.IntegrityError:
             self._send(409, {"error": "duplicate_idempotency_key", "idempotency_key": idem})
@@ -422,7 +434,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_digest_drop(self) -> None:
         source, raw_body = self._auth_body()
-        if source is None:
+        if source is None or raw_body is None:
             return
         try:
             data = json.loads(raw_body.decode("utf-8"))
@@ -432,8 +444,27 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(data, dict):
             self._send(422, {"error": "body_must_be_object"})
             return
-        # Accept either {"text": "..."} or {"markdown": "..."} or full JSON summary
-        day = str(data.get("as_of") or data.get("date") or time.strftime("%Y-%m-%d"))
+        # A sender-controlled date must never address receiver-owned receipts.
+        # Full ISO source timestamps still map to their calendar-day alias.
+        value = str(data.get("as_of") or data.get("date") or time.strftime("%Y-%m-%d"))
+        try:
+            day = date.fromisoformat(value[:10]).isoformat()
+        except ValueError:
+            self._send(422, {"error": "bad_digest_date"})
+            return
+        if source == "jd":
+            try:
+                receipt = news_history.capture(BASE, raw_body, day)
+            except (OSError, ValueError, UnicodeError):
+                log.error("digest_drop storage_failed source=jd")
+                self._send(500, {"error": "storage_unavailable"})
+                return
+            log.info("digest_drop source=jd day=%s bytes=%s received_at=%s body_sha256=%s",
+                     day, len(raw_body), receipt["received_at"], receipt["body_sha256"])
+            self._send(200, {"status": "accepted", "source": source, "day": day,
+                             "path": str(BASE / "inbox" / source / f"digest-{day}.json"),
+                             "received_at": receipt["received_at"], "body_sha256": receipt["body_sha256"]})
+            return
         inbox = BASE / "inbox" / source
         inbox.mkdir(parents=True, exist_ok=True)
         # Keep one latest + dated file

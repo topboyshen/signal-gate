@@ -9,6 +9,7 @@
 !/app/review_bot.py
 !/app/digest.py
 !/app/digest_content.py
+!/app/news_history.py
 !/app/selftest.py
 !/app/review_selftest.py
 !/app/e2e_forward_check.py
@@ -26,6 +27,7 @@
 /tests/*
 !/tests/test_offline.py
 !/tests/test_digest_content.py
+!/tests/test_news_history.py
 !/tests/test_digest_delivery.py
 !/tests/test_sealed_research.py
 

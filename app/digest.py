@@ -30,6 +30,7 @@ except ModuleNotFoundError as exc:
     _content_spec = importlib.util.spec_from_file_location(
         "signal_gate_digest_content", Path(__file__).with_name("digest_content.py")
     )
+    assert _content_spec is not None and _content_spec.loader is not None
     _content = importlib.util.module_from_spec(_content_spec)
     _content_spec.loader.exec_module(_content)
     build_report = _content.build_report
@@ -91,7 +92,7 @@ def split_text(text: str, limit: int = MAX_PART_CHARS) -> list[str]:
 
 def code_version() -> str:
     digest = hashlib.sha256()
-    for name in ("digest.py", "digest_content.py"):
+    for name in ("digest.py", "digest_content.py", "news_history.py"):
         digest.update(name.encode() + b"\0")
         digest.update(Path(__file__).with_name(name).read_bytes())
     return digest.hexdigest()
@@ -378,13 +379,12 @@ def run_digest(*, dry_run: bool = False, json_output: bool = False, now: datetim
             raise DeliveryError("render_failed") from None
         parts = split_text(report["text"])
         content_hash = hashlib.sha256(report["text"].encode()).hexdigest()
-        partial = receipt and any(p["status"] == "confirmed" for p in receipt["parts"])
-        if partial and (receipt["content_sha256"] != content_hash or len(receipt["parts"]) != len(parts)):
-            raise DeliveryError("partial_content_changed", "blocked")
-        if not partial:
-            receipt = _new_receipt(day, now, version, report["text"], report["issues"])
-        else:
+        if receipt is not None and any(p["status"] == "confirmed" for p in receipt["parts"]):
+            if receipt["content_sha256"] != content_hash or len(receipt["parts"]) != len(parts):
+                raise DeliveryError("partial_content_changed", "blocked")
             receipt.update(code_version=version, issues=report["issues"])
+        else:
+            receipt = _new_receipt(day, now, version, report["text"], report["issues"])
         try:
             secrets = load_secrets(SECRETS_PATH)
         except Exception:

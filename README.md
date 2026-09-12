@@ -182,3 +182,70 @@ Weekends have no scheduled source and explicitly omit old research. A weekday
 non-trading-day skip is not yet transported as a separately validated skip
 contract; it is conservatively reported as missing, not assumed to be a holiday.
 No model call, approval, trading action or same-day resend is added by this change.
+
+## News time provenance and point-in-time regression (2026-09-12)
+
+Three clocks have different meanings:
+
+- `items[].published_at` or `items[].provenance.published_at`: publication claimed
+  by the producer. Use ISO timestamps with seconds and an explicit timezone.
+  Date-only values remain date-only; missing publication time stays unknown.
+  The receiver does not query publishers or manufacture missing timestamps.
+- `as_of`/`date`: data dates, NOT proof of publication or arrival. Date-only
+  envelopes are no longer displayed as an invented midnight timestamp.
+- Local `received_at`: the receiver's UTC clock after successful HMAC and
+  JSON-object validation, when serializing an observation. Sender-provided
+  `received_at`, `produced_at`, signature timestamp and file mtime never supply
+  this clock. This is reception evidence, not a Telegram delivery acknowledgement.
+
+New authenticated JD digest drops retain the exact original UTF-8 request bytes
+inside private append-only records at `inbox/jd/received/<receiver-id>.json`.
+Each record includes a server timestamp and SHA-256 of those bytes, but no token
+or HMAC signature. Complete records are published atomically without overwrite;
+files are 0600 and the history directory is 0700. The latest JSON and dated JSON
+aliases remain available. `digest-latest.receipt.json` points to a receiver-owned
+record. Live rendering trusts its time only when the record and latest body
+match. JSON news never borrows an unrelated old Markdown twin.
+
+Receipt names are server-generated. Pending-signal keys are restricted to safe,
+printable single filenames (240 UTF-8 bytes max); the `digest-` namespace is
+reserved. Digest dates become safe calendar-day aliases. These checks prevent
+another authenticated ingress endpoint from overwriting reception evidence.
+HMAC construction/skew, sealed nnG8 gates, review/Quant behavior and schedules
+are unchanged. Only the receiver needs a restart to begin recording new arrivals.
+
+Strict **news-only** historical replay:
+
+```bash
+python3 -B app/news_history.py --base /opt/signal-gate \
+  --cutoff '2026-09-14T08:15:00+08:00'
+# Add --text for sanitized news; the default prints safe metadata only.
+```
+
+Replay selects the latest complete receiver record at/before the cutoff, never
+`digest-latest`, a dated legacy alias, or today's review database. Later revisions
+and late-arriving old articles are unavailable before their recorded reception.
+Publication claims after the cutoff are omitted; malformed or timezone-ambiguous
+publication claims are omitted in strict replay. Known receipt time can establish
+availability when publication is unknown, but the output explicitly says unknown.
+Publication counters describe inspected display candidates before duplicate
+folding, not the raw incoming batch size. This does not prove that an actual
+scheduled report had already read the input. It does not reconstruct research,
+approval/decision changes or execution state.
+
+Missing legacy receipts return `status=unavailable`, exit 2: **do not backfill
+history using mtime, date filenames or producer clocks**. Corrupt, mismatched,
+ambiguous selected receipts and scan limits fail closed instead of selecting an
+older healthy-looking version. Reads are bounded to 10,000 directory entries
+and roughly 2 MB per candidate; the renderer retains its 512 KiB body limit.
+There is no automatic history deletion or import of old artifacts in this rollout.
+The receiver filesystem/account and synchronized host clock are trusted; SHA-256
+is a content identifier, not protection against a compromised local account.
+
+Run `test_news_history.py` with the other offline suites. Tests use synthetic
+publication/arrival clocks and block network and all SQLite access during replay.
+They cover exact cutoff boundaries, late corrections, unknown time precision,
+spoofed sender times, byte hashes, corrupt/symlink receipts and read-only behavior.
+Receiver tests ensure failed authentication/storage cannot return a successful
+reception acknowledgement. Reception records and aliases remain excluded from
+Git; no production inputs or credentials belong in these fixtures.

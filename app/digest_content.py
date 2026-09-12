@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from datetime import datetime, timedelta
+import importlib.util
 import ipaddress
 import json
 from pathlib import Path
@@ -15,6 +16,11 @@ import unicodedata
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
+
+_history_spec = importlib.util.spec_from_file_location("content_news_history", Path(__file__).with_name("news_history.py"))
+assert _history_spec is not None and _history_spec.loader is not None
+news_history = importlib.util.module_from_spec(_history_spec)
+_history_spec.loader.exec_module(news_history)
 
 TZ = ZoneInfo("Asia/Shanghai")
 MAX_INPUT = 512 * 1024
@@ -230,9 +236,11 @@ def news_item_key(item: dict, provenance: dict) -> str:
 
 
 class Renderer:
-    def __init__(self, base: Path, db_path: Path, now: datetime, *, require_sealed_research: bool = True):
+    def __init__(self, base: Path, db_path: Path, now: datetime, *, require_sealed_research: bool = True,
+                 news_snapshot: tuple[str, dict] | None = None):
         self.base, self.db_path, self.now = base.resolve(), db_path, now
         self.require_sealed_research = require_sealed_research
+        self.news_snapshot = news_snapshot  # Only the verified news-history CLI supplies this.
         self.issues: list[str] = []
         self.sources: dict[str, dict] = {}
         self.pending_count: int | None = None
@@ -257,16 +265,37 @@ class Renderer:
             return raw.decode("utf-8")
         except UnicodeError:
             self.issue(source, "invalid")
-        except OSError:
+        except (OSError, RuntimeError):
             self.issue(source, "io_error")
         return None
 
+    def news_receipt(self, raw: str | None) -> dict:
+        if self.news_snapshot is not None:
+            return {**self.news_snapshot[1], "receipt_status": "verified"}
+        if raw is not None:
+            try:
+                return {**news_history.latest_receipt(self.base, raw), "receipt_status": "verified"}
+            except news_history.HistoryError as exc:
+                if str(exc) != "receipt_missing":
+                    self.issue("jd", "invalid")
+                    return {"received_at": None, "receipt_status": "invalid"}
+        return {"received_at": None, "receipt_status": "missing"}
+
     def source(self, name: str) -> tuple[dict | None, str]:
         folder = self.base / "inbox" / name
-        raw = self.read(folder / "digest-latest.json", name)
-        # Strict research is JSON-only; an unrelated stale Markdown twin must
-        # neither supply content nor poison a valid sealed contract.
-        read_markdown = name != "quant" and not (name == "nng8" and self.require_sealed_research)
+        snapshot = self.news_snapshot if name == "jd" else None
+        json_file = folder / "digest-latest.json"
+        try:
+            json_present = name == "jd" and (snapshot is not None or json_file.exists() or json_file.is_symlink())
+        except OSError:
+            json_present = True  # Unreadable JSON cannot authorize an old MD fallback.
+        raw = snapshot[0] if snapshot is not None else self.read(json_file, name)
+        if snapshot is not None and raw is not None and len(raw.encode("utf-8")) > MAX_INPUT:
+            self.issue(name, "too_large")
+            raw = None
+        # Sealed research and received JSON news cannot borrow unrelated MD.
+        read_markdown = (name != "quant" and not (name == "nng8" and self.require_sealed_research)
+                         and not (name == "jd" and (json_present or raw is not None)))
         md = self.read(folder / "digest-latest.md", name) if read_markdown else None
         data = None
         if raw is not None:
@@ -283,15 +312,23 @@ class Renderer:
             return None, ""
         stamp = None
         supplied = False
+        source_value = None
         if data is not None:
             for key in DATE_KEYS:
                 if key in data:
-                    supplied, stamp = True, parse_date(data[key])
+                    source_value = data[key]
+                    supplied, stamp = True, parse_date(source_value)
                     break
         if not supplied and md:
             match = re.search(r"(?im)^\s*(?:as_of|date|日期|数据日期|来源日期|生成时间)\s*[:：=]\s*(\S+(?: \d\d:\d\d(?::\d\d)?)?)", "\n".join(md.splitlines()[:12]))
             if match:
-                supplied, stamp = True, parse_date(match.group(1))
+                source_value = match.group(1)
+                supplied, stamp = True, parse_date(source_value)
+        if name == "jd" and isinstance(source_value, str) and len(source_value) > 10:
+            try:
+                stamp = news_history.precise_time(source_value).astimezone(TZ)
+            except news_history.HistoryError:
+                stamp = None
         status = "ok"
         if stamp is None:
             status = "invalid" if supplied else "unknown_date"
@@ -304,8 +341,67 @@ class Renderer:
         self.sources[name] = {
             "status": status, "as_of": stamp.isoformat() if stamp else None,
             "age_hours": round((self.now - stamp).total_seconds() / 3600, 1) if stamp else None,
+            "precision": "date" if isinstance(source_value, str) and len(source_value) == 10 else "datetime",
         }
+        if name == "jd":
+            self.sources[name].update(self.news_receipt(raw))
+            received = parse_date(self.sources[name].get("received_at"))
+            if status == "future" or received and received > self.now:
+                self.issue(name, "future")
+                return None, ""
         return data, md or ""
+
+    def item_time(self, name: str, item: dict, provenance: dict) -> tuple[str, bool]:
+        # Event windows and receipt clocks are not publication timestamps.
+        stamp, value, field = None, None, ""
+        invalid = False
+        candidates = []
+        for mapping in (item, provenance):
+            publication = mapping.get("published_at")
+            if publication is None or isinstance(publication, str) and not publication.strip():
+                continue
+            candidates.append((mapping, "published_at"))
+        if not candidates:
+            for mapping in (item, provenance):
+                key = next((key for key in ("timestamp", "as_of", "date") if key in mapping), None)
+                if key is not None:
+                    candidates.append((mapping, key))
+        for mapping, key in candidates:
+            value = mapping[key]
+            stamp = parse_date(value)
+            if name == "jd" and isinstance(value, str) and len(value) > 10:
+                try:
+                    stamp = news_history.precise_time(value).astimezone(TZ)
+                except news_history.HistoryError:
+                    stamp = None  # Do not guess a timezone for a publication claim.
+            if stamp is not None:
+                field = key
+                break
+            invalid = True
+            self.issue(name, "invalid")
+        eligible = not (name == "jd" and self.news_snapshot is not None and invalid)
+        label = ""
+        if name == "jd" and field != "published_at":
+            label = "发布时间未知"
+            info = self.sources[name]
+            info["publication_unknown_count"] = info.get("publication_unknown_count", 0) + 1
+        if stamp is not None:
+            only_date = isinstance(value, str) and len(value) == 10
+            shown = stamp.strftime("%Y-%m-%d") + "（仅日期）" if only_date else stamp.strftime("%Y-%m-%d %H:%M:%S")
+            if name == "jd":
+                label += ("发布 " if field == "published_at" else "；条目数据时间 ") + shown
+            else:
+                label = shown
+            if stamp > self.now:
+                self.issue(name, "future")
+                if name == "jd":
+                    eligible = False
+            elif self.now - stamp > timedelta(hours=72):
+                self.issue(name, "stale")
+        if not eligible:
+            info = self.sources[name]
+            info["excluded_time_count"] = info.get("excluded_time_count", 0) + 1
+        return (f"（{label}）" if label else ""), eligible
 
     def highlights(self, name: str) -> list[str]:
         if name == "nng8" and self.require_sealed_research and self.now.weekday() >= 5:
@@ -364,25 +460,10 @@ class Renderer:
                 if kind == "index":
                     shown = INDEX_NAMES[symbol]
                 line = "｜".join(part for part in (shown, side(item.get("side")) if symbol and kind != "index" else "", title) if part)
-                # event_window is a signal-validity window, not publication time.
-                date_fields = ("published_at", "timestamp", "as_of", "date")
-                stamp = None
-                for date_data in (item, provenance):
-                    date_key = next((key for key in date_fields if key in date_data), None)
-                    if date_key is None:
-                        continue
-                    stamp = parse_date(date_data[date_key])
-                    if stamp is not None:
-                        break
-                    # Still show a valid nested timestamp, but do not hide the
-                    # malformed authoritative field by reporting a healthy input.
-                    self.issue(name, "invalid")
-                if stamp:
-                    line += f"（{stamp.strftime('%Y-%m-%d %H:%M')}）"
-                    if stamp > self.now:
-                        self.issue(name, "future")
-                    elif self.now - stamp > timedelta(hours=72):
-                        self.issue(name, "stale")
+                time_text, eligible = self.item_time(name, item, provenance)
+                if not eligible:
+                    continue
+                line += time_text
                 publisher = first_text(item, ("source",), 60) or first_text(provenance, ("source",), 60)
                 if publisher:
                     line += f"｜来源：{publisher}"
@@ -411,7 +492,10 @@ class Renderer:
         if text and any(word in text.lower() for word in ("skeleton", "not wired")):
             self.issue(name, "placeholder")
             return [f"{LABELS[name]}：仅占位摘要，尚无有效要点。"]
-        return self.text_highlights(name, text)
+        rendered = self.text_highlights(name, text)
+        if name == "jd":
+            rendered.insert(0, "发布时间未知（正文未提供结构化时间）。")
+        return rendered
 
     def text_highlights(self, name: str, text: str) -> list[str]:
         # Build bounded semantic blocks: a watch-list label and its bullets are
@@ -846,7 +930,14 @@ class Renderer:
                 elif name == "nng8" and "nng8:missing" in self.issues:
                     lines.append("研究：当日密封摘要缺报，旧稿未纳入。")
                 else:
-                    lines.append(f"{LABELS[name]}：来源时间 {label}（北京时间）。")
+                    detail = f"来源时间 {label}（北京时间）"
+                    if stamp and info.get("precision") == "date":
+                        detail = f"数据日期 {stamp.strftime('%Y-%m-%d')}（未提供时分）"
+                    if name == "jd":
+                        received = parse_date(info.get("received_at"))
+                        reception = received.strftime('%Y-%m-%d %H:%M:%S') + "（北京时间）" if received else "未知（无匹配收件记录）"
+                        detail += f"；本机接收 {reception}"
+                    lines.append(f"{LABELS[name]}：{detail}。")
         if self.issues:
             lines.append("警示：" + "；".join(f"{LABELS[source]}{WARNINGS[code]}" for source, code in (item.split(":") for item in self.issues)) + "。")
         else:
