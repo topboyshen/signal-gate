@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from contextlib import closing
 from datetime import datetime, timedelta
-from difflib import SequenceMatcher
 import ipaddress
 import json
 from pathlib import Path
@@ -204,15 +203,30 @@ def decorate_symbols(line: str, names: dict[str, str]) -> str:
     return SYMBOL_RE.sub(repl, line)
 
 
-def similar_news_title(left: str, right: str) -> bool:
-    """Treat near-duplicate headlines as one item; exact containment or high overlap."""
-    a = re.sub(r"\s+", "", left)
-    b = re.sub(r"\s+", "", right)
-    if not a or not b:
-        return False
-    if a in b or b in a:
-        return True
-    return SequenceMatcher(None, a, b).ratio() >= 0.72
+def news_item_key(item: dict, provenance: dict) -> str:
+    """Conservative, batch-local identity; never infer equivalent financial facts.
+
+    Use full input fields, not redacted/truncated display text. Only whitespace
+    in editorial text is normalized: numbers, signs, units, dates, entities and
+    corrections remain significant. Differing provenance is kept, even when
+    the rendered headlines look identical. This internal key must not be logged
+    or persisted; input size is bounded by the reader.
+    """
+    text_fields = ("title", "note", "reason", "summary")
+    fields = text_fields + (
+        "symbol", "code", "name", "short_name", "sec_name", "side", "source",
+        "url", "link", "source_url", "event_id", "idempotency_key",
+        "published_at", "timestamp", "as_of", "date",
+    )
+    layers = []
+    for mapping in (item, provenance):
+        identity = {}
+        for field in fields:
+            if field in mapping:
+                value = mapping[field]
+                identity[field] = " ".join(value.split()) if field in text_fields and isinstance(value, str) else value
+        layers.append(identity)
+    return json.dumps(layers, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 class Renderer:
@@ -315,7 +329,7 @@ class Renderer:
                 break
         if items is not None:
             kept, filtered, invalid_items = [], 0, 0
-            seen_titles: list[str] = []
+            seen_news: set[str] = set()
             for item in items[:MAX_ROWS]:
                 if isinstance(item, str):
                     item = {"title": item}
@@ -344,10 +358,6 @@ class Renderer:
                 index_recap = bool(title and "上证指数" in title and "深证成指" in title and "收报" in title)
                 if index_recap or (kind == "index" and not title):
                     continue
-                if name == "jd" and title:
-                    if any(similar_news_title(title, old) for old in seen_titles):
-                        continue
-                    seen_titles.append(title)
                 shown = display_instrument(
                     symbol, first_text(item, ("name", "short_name", "sec_name"), 12),
                 ) if symbol else ""
@@ -380,7 +390,15 @@ class Renderer:
                              for key in ("url", "link", "source_url") if safe_url(mapping.get(key))), "")
                 if link:
                     line += f" {link}"
-                if line not in kept:
+                # Validate every item's date/provenance before deduplication.
+                # Rendered text is lossy and cannot establish news identity.
+                if name == "jd":
+                    key = news_item_key(item, provenance)
+                    if key in seen_news:
+                        continue
+                    seen_news.add(key)
+                    kept.append(line)
+                elif line not in kept:
                     kept.append(line)
             if len(items) > MAX_ROWS:
                 self.issue(name, "truncated")
@@ -485,7 +503,7 @@ class Renderer:
         unavailable = ["研究：尚未收到当日通过校验的正式研究摘要；旧稿未纳入。"]
         contract = data.get("research_contract") if isinstance(data, dict) else None
         summary = data.get("research_summary") if isinstance(data, dict) else None
-        if not isinstance(contract, dict) or not isinstance(summary, dict):
+        if not isinstance(data, dict) or not isinstance(contract, dict) or not isinstance(summary, dict):
             self.issue("nng8", "missing")
             return unavailable
         try:

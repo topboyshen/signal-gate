@@ -17,6 +17,7 @@ import urllib.request
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "app" / "digest_content.py"
 SPEC = importlib.util.spec_from_file_location("signal_gate_digest_content_test", MODULE_PATH)
+assert SPEC is not None and SPEC.loader is not None
 content = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(content)
 REAL_CONNECT = sqlite3.connect
@@ -678,17 +679,117 @@ class DigestContentTests(unittest.TestCase):
         self.assertIn("有效资讯", report["text"])
         self.assertIn("nng8:missing", report["issues"])
 
-    def test_similar_historical_headlines_are_deduplicated(self):
+    def test_similar_historical_headlines_are_not_assumed_equivalent(self):
         self.complete()
         self.source("jd", {"as_of": "2026-09-07", "items": [
             {"symbol": "399006.SZ", "title": "收评：创业板指冲高回落跌超1% 农业板块逆势走强"},
             {"symbol": "399006.SZ", "title": "A股收盘：创业板指震荡跌超1%，农业股逆势爆发"},
             {"symbol": "399006.SZ", "title": "9月8日收评：创业板指震荡跌超1%，农业股逆势爆发"},
-            {"symbol": "000688.SH", "title": "科创50ETF近5日吸金47亿"},
         ]})
         text = self.render()["text"]
-        self.assertEqual(text.count("创业板指震荡跌超1%"), 1)
-        self.assertIn("科创50ETF近5日吸金47亿", text)
+        # Similar wording is not evidence that dates/facts are interchangeable.
+        self.assertEqual(text.count("创业板指震荡跌超1%"), 2)
+        self.assertIn("冲高回落", text)
+
+    def test_exact_news_retries_free_slots_for_distinct_items(self):
+        self.complete()
+        item = {"symbol": "399006.SZ", "title": "合成资讯 标题甲",
+                "provenance": {"source": "合成来源", "event_id": "synthetic-a"}}
+        self.source("jd", {"as_of": "2026-09-07", "items": [
+            item, {**item, "title": "  合成资讯  标题甲\n"},
+            {"title": "独立事件乙"}, {"title": "独立事件丙"},
+        ]})
+        text = self.render()["text"]
+        self.assertEqual(text.count("合成资讯 标题甲"), 1)
+        self.assertIn("独立事件乙", text)
+        self.assertIn("独立事件丙", text)
+
+    def test_news_fact_changes_and_containment_are_not_duplicates(self):
+        self.complete()
+        cases = (
+            ("某公司净利润增长10%", "某公司净利润下降10%"),
+            ("某公司净利润增长10%", "某公司净利润增长90%"),
+            ("合成指标变动+1.0%", "合成指标变动-1.0%"),
+            ("合成指标变动1.0%", "合成指标变动10%"),
+            ("某公司投资10亿元", "某公司投资10万元"),
+            ("甲公司拟投资10亿元建设新工厂", "乙公司拟投资10亿元建设新工厂"),
+            ("某公司发生重大资产重组", "某公司未发生重大资产重组"),
+            ("某公司拟进行资产重组", "某公司拟进行资产重组，公司随后否认"),
+            ("2026-09-07公司发布公告", "2026-09-08公司发布公告"),
+            ("AB C公司发布公告", "A BC公司发布公告"),
+        )
+        for left, right in cases:
+            with self.subTest(left=left, right=right):
+                self.source("jd", {"as_of": "2026-09-07", "items": [
+                    {"title": left}, {"title": right},
+                ]})
+                text = self.render()["text"]
+                self.assertEqual(sum(line.startswith("- ") for line in text.splitlines()), 2)
+                self.assertIn(left, text)
+                self.assertIn(right, text)
+
+    def test_same_headline_with_different_identity_is_kept(self):
+        self.complete()
+        cases = (
+            ("symbol", "600000.SH", "600519.SH"),
+            ("name", "合成公司甲", "合成公司乙"),
+            ("side", "long", "short"),
+            ("source", "合成来源甲", "合成来源乙"),
+            ("url", "https://example.com/a", "https://example.com/b"),
+            ("event_id", "synthetic-a", "synthetic-b"),
+            ("published_at", "2026-09-07T14:00:01+08:00", "2026-09-07T14:00:02+08:00"),
+        )
+        for nested in (False, True):
+            for field, left, right in cases:
+                with self.subTest(nested=nested, field=field):
+                    items = [{"title": "共同标题", field: value} for value in (left, right)]
+                    if nested:
+                        items = [{"provenance": item} for item in items]
+                    self.source("jd", {"as_of": "2026-09-07", "items": items})
+                    self.assertEqual(self.render()["text"].count("共同标题"), 2)
+
+    def test_news_identity_uses_full_title_not_display_prefix(self):
+        self.complete()
+        # Even differences beyond the sanitizer's input cap are not duplicates.
+        prefix = "合成标题" * (content.MAX_BODY // 4 + 1)
+        self.source("jd", {"as_of": "2026-09-07", "items": [
+            {"title": prefix + "增长10%"}, {"title": prefix + "下降10%"},
+        ]})
+        text = self.render()["text"]
+        self.assertEqual(sum(line.startswith("- ") for line in text.splitlines()), 2)
+        self.assertLess(len(text), 3000)
+
+    def test_redaction_collisions_do_not_merge_or_expose_raw_identity(self):
+        self.complete()
+        self.source("jd", {"as_of": "2026-09-07", "items": [
+            {"title": "合成新闻 secret=SYNTHETIC_PRIVATE_A"},
+            {"title": "合成新闻 secret=SYNTHETIC_PRIVATE_B"},
+        ]})
+        report = self.render()
+        self.assertEqual(report["text"].count("合成新闻"), 2)
+        self.assertNotIn("SYNTHETIC_PRIVATE", json.dumps(report))
+
+    def test_repeated_headlines_cannot_hide_date_warnings(self):
+        self.complete()
+        for published, issue in (("2000-01-01", "stale"),
+                                 ("2099-01-01", "future"),
+                                 ("not-a-date", "invalid")):
+            with self.subTest(issue=issue):
+                good = {"title": "共同标题", "published_at": "2026-09-07"}
+                bad = {"title": "共同标题", "published_at": published}
+                self.source("jd", {"as_of": "2026-09-07", "items": [good, bad, bad]})
+                report = self.render()
+                self.assertEqual(report["text"].count("共同标题"), 2)
+                self.assertIn("jd:" + issue, report["issues"])
+
+    def test_duplicate_news_does_not_hide_input_truncation(self):
+        self.complete()
+        self.source("jd", {"as_of": "2026-09-07", "items": [
+            {"title": "重复合成新闻"},
+        ] * (content.MAX_ROWS + 1)})
+        report = self.render()
+        self.assertEqual(report["text"].count("重复合成新闻"), 1)
+        self.assertIn("jd:truncated", report["issues"])
 
     def test_execution_drops_index_rows_from_counts_and_details(self):
         self.complete()
