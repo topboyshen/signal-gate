@@ -215,13 +215,15 @@ class NewsHistoryTests(unittest.TestCase):
                 history.select_before(self.root, CUTOFF)
 
     def test_cli_metadata_has_no_raw_payload_and_is_read_only(self):
-        self.receive(self.payload("合成正文 secret=SYNTHETIC_PRIVATE_MARKER"))
+        # Keep the fake credential in runtime test data, not a secret-like literal.
+        private_marker = "SYNTHETIC_PRIVATE_MARKER"
+        self.receive(self.payload(f"合成正文 secret={private_marker}"))
         before = self.tree()
         output = io.StringIO()
         with redirect_stdout(output):
             rc = history.main(["--base", str(self.root), "--cutoff", CUTOFF.isoformat()])
         self.assertEqual(rc, 0)
-        self.assertNotIn("SYNTHETIC_PRIVATE_MARKER", output.getvalue())
+        self.assertNotIn(private_marker, output.getvalue())
         self.assertNotIn("合成正文", output.getvalue())
         self.assertEqual(json.loads(output.getvalue())["mode"], "news_only_as_of")
         self.assertEqual(before, self.tree())
