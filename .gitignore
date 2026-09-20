@@ -10,6 +10,7 @@
 !/app/digest.py
 !/app/digest_content.py
 !/app/news_history.py
+!/app/research_receipts.py
 !/app/selftest.py
 !/app/review_selftest.py
 !/app/e2e_forward_check.py
@@ -30,6 +31,8 @@
 !/tests/test_news_history.py
 !/tests/test_digest_delivery.py
 !/tests/test_sealed_research.py
+!/tests/test_research_receipts.py
+!/tests/test_research_receiver.py
 
 # Defense in depth for runtime material, including nested copies.
 **/*.env

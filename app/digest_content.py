@@ -22,6 +22,11 @@ assert _history_spec is not None and _history_spec.loader is not None
 news_history = importlib.util.module_from_spec(_history_spec)
 _history_spec.loader.exec_module(news_history)
 
+_research_spec = importlib.util.spec_from_file_location("content_research_receipts", Path(__file__).with_name("research_receipts.py"))
+assert _research_spec is not None and _research_spec.loader is not None
+research_receipts = importlib.util.module_from_spec(_research_spec)
+_research_spec.loader.exec_module(research_receipts)
+
 TZ = ZoneInfo("Asia/Shanghai")
 MAX_INPUT = 512 * 1024
 MAX_DB = 64 * 1024 * 1024
@@ -284,6 +289,24 @@ class Renderer:
     def source(self, name: str) -> tuple[dict | None, str]:
         folder = self.base / "inbox" / name
         snapshot = self.news_snapshot if name == "jd" else None
+        research_record = None
+        if name == "nng8":
+            try:
+                record_raw, research_record = research_receipts.read_record(
+                    self.base, name, self.now.date().isoformat())
+                if len(record_raw) > MAX_INPUT:
+                    raise ValueError("research_input_too_large")
+                received = parse_date(research_record["stored_at"])
+                if received is None or received > self.now:
+                    raise ValueError("research_receipt_future")
+                snapshot = (record_raw.decode("utf-8"), research_record)
+            except FileNotFoundError:
+                pass  # Legacy fallback remains unverified; no receipt is manufactured.
+            except (OSError, ValueError, RecursionError):
+                self.issue(name, "invalid")
+                self.sources[name] = {"status": "invalid", "as_of": None,
+                                      "age_hours": None, "receipt_status": "invalid"}
+                return None, ""  # Corruption cannot authorize a healthy legacy fallback.
         json_file = folder / "digest-latest.json"
         try:
             json_present = name == "jd" and (snapshot is not None or json_file.exists() or json_file.is_symlink())
@@ -343,6 +366,12 @@ class Renderer:
             "age_hours": round((self.now - stamp).total_seconds() / 3600, 1) if stamp else None,
             "precision": "date" if isinstance(source_value, str) and len(source_value) == 10 else "datetime",
         }
+        if name == "nng8":
+            self.sources[name]["receipt_status"] = "verified" if research_record else "missing"
+            if research_record:
+                self.sources[name].update(received_at=research_record["stored_at"],
+                    content_sha256=research_record["content_sha256"],
+                    receiver_record_id=research_record["record_id"])
         if name == "jd":
             self.sources[name].update(self.news_receipt(raw))
             received = parse_date(self.sources[name].get("received_at"))

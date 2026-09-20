@@ -92,7 +92,7 @@ def split_text(text: str, limit: int = MAX_PART_CHARS) -> list[str]:
 
 def code_version() -> str:
     digest = hashlib.sha256()
-    for name in ("digest.py", "digest_content.py", "news_history.py"):
+    for name in ("digest.py", "digest_content.py", "news_history.py", "research_receipts.py"):
         digest.update(name.encode() + b"\0")
         digest.update(Path(__file__).with_name(name).read_bytes())
     return digest.hexdigest()

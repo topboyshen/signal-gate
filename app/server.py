@@ -8,6 +8,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -25,6 +26,11 @@ _history_spec = importlib.util.spec_from_file_location("receiver_news_history", 
 assert _history_spec is not None and _history_spec.loader is not None
 news_history = importlib.util.module_from_spec(_history_spec)
 _history_spec.loader.exec_module(news_history)
+
+_research_spec = importlib.util.spec_from_file_location("receiver_research_receipts", Path(__file__).with_name("research_receipts.py"))
+assert _research_spec is not None and _research_spec.loader is not None
+research_receipts = importlib.util.module_from_spec(_research_spec)
+_research_spec.loader.exec_module(research_receipts)
 
 BASE = Path(os.environ.get("SIGNAL_GATE_HOME", "/opt/signal-gate"))
 DB_PATH = Path(os.environ.get("SIGNAL_GATE_DB", str(BASE / "data" / "signals.db")))
@@ -274,7 +280,50 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/healthz", "/health"):
             self._send(200, {"ok": True, "service": "signal-gate"})
             return
+        if path.startswith("/records/"):
+            self._handle_record_query()
+            return
         self._send(404, {"error": "not_found"})
+
+    def _handle_record_query(self) -> None:
+        """Authenticate the exact method/path before any read; never create state."""
+        source = self.headers.get("X-Source") or ""
+        timestamp = self.headers.get("X-Timestamp") or ""
+        signature = self.headers.get("X-Signature") or ""
+        secret = self.secrets.get("HMAC_SECRET_NNG8") or ""
+        if source != "nng8" or not secret:
+            self._send(401, {"error": "bad_source"})
+            return
+        if not re.fullmatch(r"[0-9]{1,12}", timestamp):
+            self._send(401, {"error": "bad_timestamp"})
+            return
+        if abs(int(time.time()) - int(timestamp)) > MAX_SKEW_SEC:
+            self._send(401, {"error": "timestamp_skew"})
+            return
+        expected = "sha256=" + hmac.new(secret.encode(),
+            (timestamp + ".GET." + self.path).encode(), hashlib.sha256).hexdigest()
+        if not re.fullmatch(r"sha256=[0-9a-f]{64}", signature) or not hmac.compare_digest(expected, signature):
+            self._send(401, {"error": "bad_signature"})
+            return
+        # Exact canonical URL: no query string, percent decoding or traversal.
+        match = re.fullmatch(r"/records/nng8/([0-9]{4}-[0-9]{2}-[0-9]{2})", self.path)
+        if not match:
+            self._send(422, {"error": "bad_record_path"})
+            return
+        try:
+            date.fromisoformat(match[1])
+        except ValueError:
+            self._send(422, {"error": "bad_record_path"})
+            return
+        try:
+            _, receipt = research_receipts.read_record(BASE, source, match[1])
+        except FileNotFoundError:
+            self._send(404, {"status": "not_found"})
+            return
+        except (ValueError, OSError, RecursionError):
+            self._send(503, {"error": "record_unavailable"})
+            return
+        self._send(200, receipt)
 
     def _auth_body(self) -> tuple[str, bytes] | tuple[None, None]:
         """Return (source, raw_body) or send error and (None, None)."""
@@ -443,6 +492,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not isinstance(data, dict):
             self._send(422, {"error": "body_must_be_object"})
+            return
+        if source == "nng8":
+            try:
+                receipt = research_receipts.capture(BASE, raw_body)
+            except research_receipts.ContentConflict:
+                self._send(409, {"status": "rejected", "reason": "content_conflict"})
+                return
+            except ValueError:
+                self._send(422, {"error": "invalid_research_contract"})
+                return
+            except (OSError, RecursionError):
+                log.error("digest_drop storage_failed source=nng8")
+                self._send(500, {"error": "storage_unavailable"})
+                return
+            log.info("digest_drop source=nng8 day=%s target_date=%s stored=true content_sha256=%s record_id=%s",
+                     receipt["day"], receipt["target_date"], receipt["content_sha256"], receipt["record_id"])
+            self._send(200, receipt)
             return
         # A sender-controlled date must never address receiver-owned receipts.
         # Full ISO source timestamps still map to their calendar-day alias.

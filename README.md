@@ -249,3 +249,56 @@ spoofed sender times, byte hashes, corrupt/symlink receipts and read-only behavi
 Receiver tests ensure failed authentication/storage cannot return a successful
 reception acknowledgement. Reception records and aliases remain excluded from
 Git; no production inputs or credentials belong in these fixtures.
+
+## nnG8 byte-bound reception receipts (2026-09-20)
+
+For newly received nnG8 digest drops, the canonical business input is a private,
+append-only record at `inbox/nng8/research-receipts/<report-day>.json`. It retains
+the original UTF-8 POST bytes in base64, their SHA-256 and byte count, the report
+hash, both dates, an opaque receiver ID and a receiver UTC storage timestamp.
+New directories/files are 0700/0600; existing parent permissions are unchanged.
+No legacy latest/dated alias is copied, rewritten, imported or upgraded.
+
+Actual producer fields are top-level `target_date` and `as_of`, plus
+`research_contract.report_date`, `as_of`, `report_sha256`. The dates must be
+valid calendar dates, agree across levels, and satisfy `as_of <= target_date`.
+This storage check does not infer a trading calendar or replace the stricter
+existing digest publication/semantic gate. The 512 KiB limit matches the reader.
+
+Successful POST acknowledgement includes `stored=true`, `content_sha256`,
+`record_id`, `stored_at`, `target_date`, `as_of` and `day` (the latter two both
+mean the data date). The hash is recomputed from the saved original bytes, not
+from reserialized JSON. A process-shared lock, no-overwrite atomic publication,
+file/directory fsync and readback precede acknowledgement. Same key `(nng8,
+target_date)` and same bytes returns the original acknowledgement; different
+bytes returns 409 `content_conflict`, leaving the original record unchanged.
+Errors never produce `stored=true`; a crash/fsync error can leave complete but
+unacknowledged evidence requiring read-only investigation, not automatic resend.
+
+`GET /records/nng8/YYYY-MM-DD` returns only the verified receipt, never the body
+or internal path. It uses `X-Source: nng8`, a timestamp within the existing skew,
+and `X-Signature: sha256=<HMAC(secret, timestamp + ".GET." + exact_path)>`.
+Authentication is checked before opening records; queries do not create a
+directory, take a writing lock or modify state. Missing records return 404;
+corrupt/unreadable evidence returns 503, not a fabricated successful receipt.
+The existing HTTPS listener exposes only this bounded GET route; no port,
+certificate, firewall, private POST URL or credential is changed.
+
+The digest reader consumes the same canonical record for its report date,
+verifies its bytes and observed time, and then applies the unchanged sealed
+research checks. A missing canonical record retains the existing legacy reading
+path **without** inventing a receipt; a corrupt record cannot fall back to an
+apparently healthy alias. Stored does not mean the downstream digest was sent.
+
+Run the two additional offline suites with the original five:
+
+```text
+python3 -B -m unittest discover -s tests -p 'test_research_receipts.py' -v
+python3 -B -m unittest discover -s tests -p 'test_research_receiver.py' -v
+```
+
+They cover real handler/authentication, durable storage, process concurrency,
+restart/readback, conflicts, failures, consumer binding and no legacy import.
+No production POST, database access, model call or Telegram send is involved.
+Sender-side v2 receipt persistence and the next natural handoff remain separate
+acceptance steps; this receiver deployment does not rewrite historic nnG8 state.

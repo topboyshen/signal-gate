@@ -199,10 +199,16 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(Path(result["path"]), self.root/"inbox/jd/digest-2026-09-07.json")
 
     def test_nng8_digest_uses_unchanged_hmac_and_no_jd_history(self):
-        status, _ = self.pending({"as_of": "2026-09-07", "text": "合成研究"},
+        body = {"source": "nng8", "target_date": "2026-09-08", "as_of": "2026-09-07",
+                "research_contract": {"report_date": "2026-09-08", "as_of": "2026-09-07",
+                                      "report_sha256": "a" * 64}, "text": "合成研究"}
+        status, ack = self.pending(body,
                                  path="/hooks/v1/digest-drop", source="nng8")
         self.assertEqual(status, 200)
-        self.assertTrue((self.root/"inbox/nng8/digest-latest.json").is_file())
+        self.assertIs(ack["stored"], True)
+        self.assertEqual(ack["content_sha256"], hashlib.sha256(json.dumps(body).encode()).hexdigest())
+        self.assertTrue((self.root/"inbox/nng8/research-receipts/2026-09-08.json").is_file())
+        self.assertFalse((self.root/"inbox/nng8/digest-latest.json").exists())
         self.assertFalse((self.root/"inbox/jd").exists())
         self.notify.assert_not_called()
 
@@ -214,6 +220,15 @@ class OfflineTests(unittest.TestCase):
             raw = original(path)
             return raw + b"\n# synthetic helper revision\n" if path.name == "news_history.py" else raw
 
+        with patch.object(Path, "read_bytes", changed_helper):
+            self.assertNotEqual(self.digest.code_version(), baseline)
+
+    def test_delivery_code_version_includes_research_receipts_helper(self):
+        baseline = self.digest.code_version()
+        original = Path.read_bytes
+        def changed_helper(path):
+            raw = original(path)
+            return raw + b"\n# synthetic receiver revision\n" if path.name == "research_receipts.py" else raw
         with patch.object(Path, "read_bytes", changed_helper):
             self.assertNotEqual(self.digest.code_version(), baseline)
 
