@@ -8,6 +8,7 @@
 !/app/server.py
 !/app/review_bot.py
 !/app/digest.py
+!/app/input_status.py
 !/app/digest_content.py
 !/app/news_history.py
 !/app/research_receipts.py
@@ -24,6 +25,7 @@
 !/systemd/signal-gate-review.service
 !/systemd/signal-gate-digest.service
 !/systemd/signal-gate-digest.timer
+!/systemd/project-portal-inputs.service
 !/tests/
 /tests/*
 !/tests/test_offline.py
@@ -33,6 +35,7 @@
 !/tests/test_sealed_research.py
 !/tests/test_research_receipts.py
 !/tests/test_research_receiver.py
+!/tests/test_input_status.py
 
 # Defense in depth for runtime material, including nested copies.
 **/*.env

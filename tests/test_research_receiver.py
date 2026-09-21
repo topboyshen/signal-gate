@@ -41,7 +41,9 @@ class ResearchReceiverTests(unittest.TestCase):
         self.payload = sample.payload(self.now)
         self.raw = json.dumps(self.payload, ensure_ascii=False, indent=1).encode("utf-8")
         self.day = "2026-09-16"
-        self.secret = "isolated-receiver-secret"
+        # Public, reproducible test material; never read a production key. A
+        # full-length derived value retains realistic HMAC signing behavior.
+        self.secret = hashlib.sha256(b"research receiver offline HMAC fixture v1").hexdigest()
         for module, attr, value in ((self.server, "BASE", self.base),
                                     (self.server, "enqueue_review_notify", Mock()),
                                     (self.server, "load_secrets", Mock(side_effect=AssertionError("secrets forbidden")))):
@@ -58,7 +60,7 @@ class ResearchReceiverTests(unittest.TestCase):
                 for p in self.base.rglob("*") if p.is_file()}
 
     def request(self, method="POST", *, raw=None, path=None, headers=None,
-                signing_method=None, signing_path=None):
+                signing_method=None, signing_path=None, signing_secret=None):
         raw = self.raw if raw is None else raw
         path = path or ("/hooks/v1/digest-drop" if method == "POST" else f"/records/nng8/{self.day}")
         stamp = str(int(time.time()))
@@ -67,7 +69,8 @@ class ResearchReceiverTests(unittest.TestCase):
         signed = (stamp + "." + (signing_method or method) + "." + (signing_path or path)).encode()
         if method == "POST":
             signed = stamp.encode() + b"." + raw
-        hdr["X-Signature"] = "sha256=" + hmac.new(self.secret.encode(), signed, hashlib.sha256).hexdigest()
+        key = self.secret if signing_secret is None else signing_secret
+        hdr["X-Signature"] = "sha256=" + hmac.new(key.encode(), signed, hashlib.sha256).hexdigest()
         hdr.update(headers or {})
         handler = object.__new__(self.server.Handler)
         handler.path, handler.headers, handler.rfile = path, hdr, io.BytesIO(raw)
@@ -149,6 +152,19 @@ class ResearchReceiverTests(unittest.TestCase):
     def test_bad_post_auth_never_writes_or_notifies(self):
         for headers in ({"X-Signature": ""}, {"X-Timestamp": "1"}, {"X-Source": "unknown"}):
             self.assertEqual(self.request(headers=headers)[0], 401)
+        self.assertEqual(self.tree(), {})
+
+    def test_different_synthetic_hmac_key_is_refused_before_storage_access(self):
+        other_key = hashlib.sha256(b"research receiver wrong offline HMAC fixture v1").hexdigest()
+        self.assertEqual(len(self.secret), 64)
+        self.assertNotEqual(other_key, self.secret)
+        for method in ("POST", "GET"):
+            with self.subTest(method=method), \
+                 patch.object(self.server.research_receipts, "capture") as capture, \
+                 patch.object(self.server.research_receipts, "read_record") as read:
+                self.assertEqual(self.request(method, signing_secret=other_key)[0], 401)
+                capture.assert_not_called()
+                read.assert_not_called()
         self.assertEqual(self.tree(), {})
 
     def test_storage_error_never_returns_success_or_internal_detail(self):

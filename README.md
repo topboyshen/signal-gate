@@ -91,6 +91,32 @@ credentials or recipients. It does not read notification secrets, write reports
 or delivery state, or send messages. A degraded source is visible in this output;
 it must not be silently treated as fresh data.
 
+### Portal current-input status (2026-09-21)
+
+`app/input_status.py` invokes only that fixed dry-run JSON command and publishes
+a separate private snapshot at `/var/lib/project-portal-inputs/status.json`.
+The directory is `signal-gate:signal-gate 0700`, the file0600. Only the check
+date/time, quality state and fixed issue codes are retained; raw output,
+hashes, paths, recipients and message IDs are not exported.
+
+Install `systemd/project-portal-inputs.service` alongside the portal's updated
+`project-portal-export.service`. Its Wants/After dependency runs this oneshot
+before the existing five-minute export; no new timer or alert is added.
+The checker runs with the real signal-gate identity (required for canonical
+receipt ownership validation), with no network, no capabilities, secrets and
+out paths inaccessible, and business storage read-only. It writes only its own
+snapshot. CLI failure, malformed result or invalid date/time publishes unknown;
+timeouts/crashes also cannot make an old snapshot fresh. The portal independently
+requires owner/mode, schema, dates, issue shape and a check age of at most15min.
+
+This status answers only **what the current input checks report**. It neither
+updates today's sent-report receipt nor proves on-time research, completeness,
+delivery or a resend. The existing digest watchdog remains authoritative for
+the already-sent digest's quality. Recovery does not rewrite that evidence.
+
+Offline coverage: `python3 -B -m unittest discover -s tests -p test_input_status.py`.
+The collector subprocess is stubbed and atomic-write tests use temporary files.
+
 Normal delivery uses a daily lock and atomic private receipt at
 `out/delivery/YYYY-MM-DD.json` (0600; directory 0700). Receipts contain report date,
 content/source-version hashes, timestamps, fixed issue codes and confirmed part
