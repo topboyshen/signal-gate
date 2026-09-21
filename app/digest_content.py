@@ -109,6 +109,19 @@ def clean(value: object, limit: int = MAX_TEXT) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+def freshness_stamp(stamp: datetime | None, source_value: object) -> datetime | None:
+    """Date-only stamps count as end of that local day for the 72h freshness window.
+
+    Midnight would falsely mark Friday trading-day digests stale on Monday morning.
+    Future checks and display keep the parsed (start-of-day) stamp.
+    """
+    if stamp is None:
+        return None
+    if isinstance(source_value, str) and len(source_value) == 10:
+        return stamp.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return stamp
+
+
 def parse_date(value: object, *, epoch: bool = False) -> datetime | None:
     try:
         if epoch and isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -357,13 +370,17 @@ class Renderer:
             status = "invalid" if supplied else "unknown_date"
         elif stamp > self.now:
             status = "future"
-        elif self.now - stamp > timedelta(hours=72) and not (name == "nng8" and self.require_sealed_research):
-            status = "stale"
+        else:
+            age_basis = freshness_stamp(stamp, source_value)
+            if age_basis is not None and self.now - age_basis > timedelta(hours=72) and not (
+                    name == "nng8" and self.require_sealed_research):
+                status = "stale"
         if status != "ok":
             self.issue(name, status)
+        age_basis = freshness_stamp(stamp, source_value) if stamp is not None else None
         self.sources[name] = {
             "status": status, "as_of": stamp.isoformat() if stamp else None,
-            "age_hours": round((self.now - stamp).total_seconds() / 3600, 1) if stamp else None,
+            "age_hours": round((self.now - age_basis).total_seconds() / 3600, 1) if age_basis else None,
             "precision": "date" if isinstance(source_value, str) and len(source_value) == 10 else "datetime",
         }
         if name == "nng8":
@@ -425,7 +442,7 @@ class Renderer:
                 self.issue(name, "future")
                 if name == "jd":
                     eligible = False
-            elif self.now - stamp > timedelta(hours=72):
+            elif self.now - freshness_stamp(stamp, value) > timedelta(hours=72):
                 self.issue(name, "stale")
         if not eligible:
             info = self.sources[name]

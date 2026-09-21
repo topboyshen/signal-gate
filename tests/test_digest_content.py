@@ -136,6 +136,14 @@ class DigestContentTests(unittest.TestCase):
         self.source("jd", {"as_of": "2026-09-04T07:59:59+08:00", "items": []})
         self.assertIn("jd:stale", self.render(monday)["issues"])
 
+    def test_weekend_date_only_as_of_uses_end_of_day(self):
+        monday = datetime(2026, 9, 7, 8, tzinfo=content.TZ)
+        self.complete("2026-09-04T08:00:00+08:00")
+        self.source("jd", {"as_of": "2026-09-04", "items": []})
+        self.assertNotIn("jd:stale", self.render(monday)["issues"])
+        self.source("jd", {"as_of": "2026-09-03", "items": []})
+        self.assertIn("jd:stale", self.render(monday)["issues"])
+
     def test_future_invalid_and_undated_are_distinct(self):
         self.complete()
         self.source("nng8", {"as_of": "2026-09-09", "items": []})
