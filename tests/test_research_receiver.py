@@ -41,6 +41,13 @@ class ResearchReceiverTests(unittest.TestCase):
         self.payload = sample.payload(self.now)
         self.raw = json.dumps(self.payload, ensure_ascii=False, indent=1).encode("utf-8")
         self.day = "2026-09-16"
+        at = self.now.replace(hour=8, minute=3).astimezone(timezone.utc)
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return at if tz is None else at.astimezone(tz)
+        clock = patch.object(self.server.research_receipts, "datetime", Clock)
+        clock.start(); self.addCleanup(clock.stop)
         # Public, reproducible test material; never read a production key. A
         # full-length derived value retains realistic HMAC signing behavior.
         self.secret = hashlib.sha256(b"research receiver offline HMAC fixture v1").hexdigest()
@@ -81,7 +88,7 @@ class ResearchReceiverTests(unittest.TestCase):
         return handler._send.call_args.args
 
     def receive(self):
-        at = self.now.replace(hour=8, minute=1).astimezone(timezone.utc)
+        at = self.now.replace(hour=8, minute=3).astimezone(timezone.utc)
         class Clock(datetime):
             @classmethod
             def now(cls, tz=None):
@@ -206,6 +213,27 @@ class ResearchReceiverTests(unittest.TestCase):
             with self.subTest(path=path), patch.object(self.server.research_receipts, "read_record") as read:
                 self.assertEqual(self.request("GET", path=path)[0], 422)
                 read.assert_not_called()
+
+    def test_calendar_skip_uses_the_same_hmac_boundary(self):
+        from test_research_contract import skip_payload, digest
+        data = skip_payload()
+        data["target_date"] = data["as_of"] = self.day
+        data["produced_at"] = "2026-09-16T08:00:30+08:00"
+        skip = data["research_skip"]
+        skip["target_date"] = self.day; skip["validated_at"] = data["produced_at"]
+        calendar = skip["calendar"]
+        calendar.update(target_date=self.day, previous_trading_date="2026-09-15",
+                        next_trading_date="2026-09-17", data_as_of="2026-09-16T07:50:00+08:00")
+        skip["proof"]["calendar_sha256"] = digest(calendar)
+        encoded = json.dumps(data).encode()
+        self.assertEqual(self.request(raw=encoded, signing_secret="wrong-synthetic")[0], 401)
+        self.assertEqual(self.tree(), {})
+        code, ack = self.request(raw=encoded)
+        self.assertEqual(code, 200)
+        self.assertEqual(ack["payload_kind"], "skip")
+        renderer = self.content.Renderer(self.base, self.base / "unused.db", self.now)
+        self.assertIn("非交易日证明", "\n".join(renderer.highlights("nng8")))
+        self.assertEqual(renderer.issues, [])
 
 
 if __name__ == "__main__":

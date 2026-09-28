@@ -9,21 +9,23 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 import research_receipts as receipts
+from test_sealed_research import payload
 
 
 DAY = "2026-09-21"
 AS_OF = "2026-09-18"
+NOW = datetime.fromisoformat("2026-09-21T08:15:00+08:00")
 
 
 def body(**changes):
-    data = {"source": "nng8", "target_date": DAY, "as_of": AS_OF,
-            "research_contract": {"report_date": DAY, "as_of": AS_OF, "report_sha256": "a" * 64},
-            "summary": "隔离样本，不发送"}
+    data = payload(NOW)
+    data["summary"] = "隔离样本，不发送"
     data.update(changes)
     return json.dumps(data, ensure_ascii=False, indent=2).encode()
 
@@ -31,7 +33,7 @@ def body(**changes):
 def capture_process(args):
     base, raw = args
     try:
-        return "ok", receipts.capture(base, raw)
+        return "ok", receipts.capture(base, raw, now=NOW)
     except receipts.ContentConflict:
         return "conflict", None
 
@@ -44,6 +46,9 @@ class ReceiptStoreTests(unittest.TestCase):
         self.raw = body()
         self.directory = self.base / "inbox" / "nng8" / receipts.STORE_DIRECTORY
         self.path = self.directory / (DAY + ".json")
+        capture = patch.object(receipts, "capture", partial(receipts.capture, now=NOW))
+        capture.start()
+        self.addCleanup(capture.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -144,12 +149,16 @@ class ReceiptStoreTests(unittest.TestCase):
                     receipts.capture(self.base, raw)
                 self.assertEqual(list(self.base.iterdir()), [])
 
-    def test_equal_dates_are_allowed_without_calendar_guessing(self):
+    def test_ready_contract_equal_dates_fail_closed_like_renderer(self):
         raw = body(as_of=DAY, research_contract={"report_date": DAY, "as_of": DAY, "report_sha256": "a" * 64})
-        self.assertEqual(receipts.capture(self.base, raw)["day"], DAY)
+        with self.assertRaises(receipts.InvalidRecord):
+            receipts.capture(self.base, raw)
+        self.assertFalse(self.directory.exists())
 
     def test_optional_contract_target_must_match(self):
-        raw = body(research_contract={"report_date": DAY, "target_date": DAY, "as_of": AS_OF, "report_sha256": "a" * 64})
+        contract = payload(NOW)["research_contract"]
+        contract["target_date"] = DAY
+        raw = body(research_contract=contract)
         self.assertEqual(receipts.capture(self.base, raw)["target_date"], DAY)
 
     def test_body_larger_than_consumer_limit_rejected_before_write(self):

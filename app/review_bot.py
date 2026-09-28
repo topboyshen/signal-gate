@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.util
 import json
 import logging
 import os
 import sqlite3
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +28,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+_outbox_spec = importlib.util.spec_from_file_location("review_review_outbox", Path(__file__).with_name("review_outbox.py"))
+review_outbox = importlib.util.module_from_spec(_outbox_spec)
+_outbox_spec.loader.exec_module(review_outbox)
 
 BASE = Path(os.environ.get("SIGNAL_GATE_HOME", "/opt/signal-gate"))
 DB_PATH = Path(os.environ.get("SIGNAL_GATE_DB", str(BASE / "data" / "signals.db")))
@@ -81,30 +87,18 @@ def migrate_review_columns(conn: sqlite3.Connection) -> None:
 def ensure_db(db_path: Path) -> None:
     with sqlite3.connect(db_path) as conn:
         migrate_review_columns(conn)
+        review_outbox.ensure_schema(conn)
         conn.commit()
 
 
 def parse_expires_at(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    return review_outbox.expiry(value)
 
 
 def is_expired(expires_at: str | None, now: datetime | None = None) -> bool:
     dt = parse_expires_at(expires_at)
     if dt is None:
-        return False
+        return True  # unknown lifetime is never permission to execute
     now = now or datetime.now(timezone.utc)
     return now >= dt
 
@@ -240,7 +234,10 @@ def apply_decision(
     reviewer: str,
     quant_cfg: dict[str, str],
 ) -> dict[str, Any]:
-    """Atomically claim review; on approve POST to Quant if not expired."""
+    """Review and durable downstream intent commit together, then claim delivery."""
+    review_outbox.ensure_schema(conn)
+    if decision not in ("approve", "reject"):
+        raise ValueError("invalid decision")
     now = int(time.time())
     cur = conn.execute(
         """
@@ -259,7 +256,6 @@ def apply_decision(
             "row": existing,
             "message": "already reviewed",
         }
-    conn.commit()
     row = fetch_row(conn, row_id)
     assert row is not None
 
@@ -273,6 +269,7 @@ def apply_decision(
     }
 
     if decision != "approve":
+        conn.commit()
         result["message"] = "rejected"
         return result
 
@@ -306,14 +303,13 @@ def apply_decision(
             "gate_id": row_id,
             "gate_source": row.get("source"),
             "idempotency_key": row.get("idempotency_key"),
+            "expires_at": row.get("expires_at"),
         }
     )
 
     url = (quant_cfg.get("APPROVED_SIGNALS_URL") or "").strip()
     secret = (quant_cfg.get("HMAC_SECRET_DEDIROCK_TO_QUANT") or "").strip()
-    x_source = (quant_cfg.get("X_SOURCE") or "dedirock").strip()
-    tls_raw = (quant_cfg.get("TLS_VERIFY") or "true").strip().lower()
-    tls_verify = tls_raw in ("1", "true", "yes", "on")
+    review_outbox.enqueue(conn, "quant", row_id, envelope)
 
     if not url or not secret:
         conn.execute(
@@ -329,29 +325,58 @@ def apply_decision(
         result["message"] = "approved but Quant config missing"
         return result
 
-    status, body = post_to_quant(url, secret, x_source, envelope, tls_verify=tls_verify)
-    quant_status = "ok" if 200 <= status < 300 else f"http_{status}"
-    stored = body[:2000]
     conn.execute(
-        """
-        UPDATE pending_signals
-        SET quant_status = ?, quant_response = ?
-        WHERE id = ?
-        """,
-        (quant_status, stored, row_id),
+        "UPDATE pending_signals SET quant_status='pending',quant_response=NULL WHERE id=?", (row_id,)
     )
     conn.commit()
-    result["quant_status"] = quant_status
-    result["quant_http"] = status
-    result["quant_body"] = stored[:300]
-    result["message"] = f"approved → Quant HTTP {status}"
-    log.info(
-        "quant_post id=%s status=%s quant_status=%s",
-        row_id,
-        status,
-        quant_status,
-    )
+    result.update(deliver_quant(conn, row_id, quant_cfg) or {"quant_status": "pending", "message": "approved; durable delivery pending"})
     return result
+
+
+def deliver_quant(conn, row_id, quant_cfg):
+    url = (quant_cfg.get("APPROVED_SIGNALS_URL") or "").strip()
+    secret = (quant_cfg.get("HMAC_SECRET_DEDIROCK_TO_QUANT") or "").strip()
+    if not url or not secret:
+        return {"quant_status": "config_missing", "message": "approved; durable delivery waiting for Quant config"}
+    job = review_outbox.claim(conn, "quant", row_id)
+    if job is None:
+        return None
+    envelope = json.loads(job["payload_json"])
+    if is_expired(envelope.get("expires_at")):
+        quant_status, status, body = "skipped_expired", None, "expiry unknown or elapsed before delivery"
+        outcome = "expired"
+    else:
+        # The sending state is already committed. Any crash/transport exception
+        # after this point is ambiguous and must not be blindly replayed.
+        try:
+            status, body = post_to_quant(url, secret, (quant_cfg.get("X_SOURCE") or "dedirock").strip(),
+                envelope, tls_verify=(quant_cfg.get("TLS_VERIFY", "true").strip().lower() in ("1", "true", "yes", "on")))
+        except Exception:
+            status, body = 0, "transport failure; delivery unknown"
+        outcome = "confirmed" if 200 <= status < 300 else "unknown"
+        quant_status = "ok" if outcome == "confirmed" else "unknown"
+    if not review_outbox.finish(conn, job, outcome, body, commit=False):
+        conn.commit()
+        return None
+    conn.execute("UPDATE pending_signals SET quant_status=?,quant_response=? WHERE id=?",
+                 (quant_status, str(body)[:2000], row_id))
+    conn.commit()
+    log.info("quant_post id=%s status=%s quant_status=%s", row_id, status, quant_status)
+    return {"quant_status": quant_status, "quant_http": status,
+            "message": "approved → Quant accepted" if quant_status == "ok" else "approved; Quant delivery " + quant_status}
+
+
+def quant_worker(quant_cfg):
+    with sqlite3.connect(DB_PATH) as conn:
+        review_outbox.recover_sending(conn, "quant")
+    while True:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                for row_id in review_outbox.pending_ids(conn, "quant"):
+                    deliver_quant(conn, row_id, quant_cfg)
+        except Exception as exc:
+            log.error("quant_worker_error type=%s", type(exc).__name__)
+        time.sleep(5)
 
 
 def handle_callback(
@@ -653,6 +678,7 @@ def main() -> int:
 
     ensure_db(DB_PATH)
     quant_cfg = build_quant_cfg(secrets, quant_env)
+    threading.Thread(target=quant_worker, args=(quant_cfg,), name="sg-quant-outbox", daemon=True).start()
     log.info(
         "mode=%s quant_target=%s tls_verify=%s x_source=%s",
         REVIEW_MODE,

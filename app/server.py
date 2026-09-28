@@ -32,6 +32,10 @@ assert _research_spec is not None and _research_spec.loader is not None
 research_receipts = importlib.util.module_from_spec(_research_spec)
 _research_spec.loader.exec_module(research_receipts)
 
+_outbox_spec = importlib.util.spec_from_file_location("receiver_review_outbox", Path(__file__).with_name("review_outbox.py"))
+review_outbox = importlib.util.module_from_spec(_outbox_spec)
+_outbox_spec.loader.exec_module(review_outbox)
+
 BASE = Path(os.environ.get("SIGNAL_GATE_HOME", "/opt/signal-gate"))
 DB_PATH = Path(os.environ.get("SIGNAL_GATE_DB", str(BASE / "data" / "signals.db")))
 SECRETS_PATH = Path(os.environ.get("SIGNAL_GATE_SECRETS", str(BASE / "secrets.env")))
@@ -124,6 +128,7 @@ def init_db(db_path: Path) -> None:
             """
         )
         migrate_review_columns(conn)
+        review_outbox.ensure_schema(conn)
         conn.commit()
 
 
@@ -163,7 +168,7 @@ def format_review_message(row: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def send_review_notify(token: str, chat_id: str, row: dict[str, Any]) -> bool:
+def send_review_notify(token: str, chat_id: str, row: dict[str, Any]) -> dict:
     """Send Telegram review prompt with Approve/Reject inline buttons. callback_data uses DB id."""
     text = format_review_message(row)
     row_id = int(row["id"])
@@ -195,7 +200,13 @@ def send_review_notify(token: str, chat_id: str, row: dict[str, Any]) -> bool:
     try:
         with urlopen(req, timeout=20) as resp:
             raw = resp.read()
-            ok = 200 <= resp.status < 300
+            ack = json.loads(raw)
+            result = ack.get("result") if isinstance(ack, dict) else None
+            message_id = result.get("message_id") if isinstance(result, dict) else None
+            chat = result.get("chat") if isinstance(result, dict) else None
+            ok = (200 <= resp.status < 300 and isinstance(ack, dict) and ack.get("ok") is True
+                  and type(message_id) is int and message_id > 0
+                  and isinstance(chat, dict) and str(chat.get("id")) == str(chat_id))
             if ok:
                 log.info(
                     "notify_sent id=%s idem=%s status=%s bytes=%s",
@@ -206,40 +217,51 @@ def send_review_notify(token: str, chat_id: str, row: dict[str, Any]) -> bool:
                 )
             else:
                 log.error("notify_failed id=%s status=%s", row_id, resp.status)
-            return ok
+            return {"status": "confirmed" if ok else "unknown", "message_id": message_id if ok else None}
     except HTTPError as exc:
-        body = exc.read()[:300]
-        log.error("notify_failed id=%s HTTPError %s: %s", row_id, exc.code, body)
-        return False
-    except (URLError, TimeoutError, OSError) as exc:
-        log.error("notify_failed id=%s: %s", row_id, exc)
-        return False
+        log.error("notify_unconfirmed id=%s HTTPError=%s", row_id, exc.code)
+        return {"status": "unknown"}
+    except (URLError, TimeoutError, OSError, ValueError, TypeError) as exc:
+        # Never log exception URLs (Telegram token is embedded in the URL).
+        log.error("notify_unconfirmed id=%s error_type=%s", row_id, type(exc).__name__)
+        return {"status": "unknown"}
+
+
+def deliver_review_notify(conn, token, chat_id, signal_id):
+    if not token or not chat_id:
+        return None  # pending survives missing configuration and restarts
+    job = review_outbox.claim(conn, "notify", signal_id)
+    if job is None:
+        return None
+    try:
+        outcome = send_review_notify(token, chat_id, json.loads(job["payload_json"]))
+        if (not isinstance(outcome, dict) or outcome.get("status") != "confirmed"
+                or type(outcome.get("message_id")) is not int or outcome["message_id"] <= 0):
+            outcome = {"status": "unknown"}
+    except Exception as exc:
+        log.error("notify_unconfirmed id=%s error_type=%s", signal_id, type(exc).__name__)
+        outcome = {"status": "unknown"}
+    review_outbox.finish(conn, job, outcome["status"], message_id=outcome.get("message_id"))
+    return outcome
 
 
 def _notify_worker(secrets: dict[str, str]) -> None:
     token = (secrets.get("TELEGRAM_DIGEST_BOT_TOKEN") or "").strip()
     chat_id = (secrets.get("TELEGRAM_DIGEST_CHAT_ID") or "").strip()
-    if not token or not chat_id:
-        log.warning(
-            "review notify disabled (missing TELEGRAM_DIGEST_BOT_TOKEN/CHAT_ID); "
-            "draining queue without send"
-        )
-        while True:
-            try:
-                _notify_q.get(timeout=3600)
-            except Empty:
-                continue
-            _notify_q.task_done()
-        return
-
+    with sqlite3.connect(DB_PATH) as conn:
+        review_outbox.recover_sending(conn, "notify")
     while True:
-        row = _notify_q.get()
         try:
-            send_review_notify(token, chat_id, row)
-        except Exception:  # noqa: BLE001
-            log.exception("notify worker crash on id=%s", row.get("id"))
-        finally:
+            with sqlite3.connect(DB_PATH) as conn:
+                for signal_id in review_outbox.pending_ids(conn, "notify"):
+                    deliver_review_notify(conn, token, chat_id, signal_id)
+        except Exception as exc:
+            log.error("notify_worker_error type=%s", type(exc).__name__)
+        try:
+            _notify_q.get(timeout=5)
             _notify_q.task_done()
+        except Empty:
+            pass
 
 
 def start_notify_worker(secrets: dict[str, str]) -> None:
@@ -399,6 +421,9 @@ class Handler(BaseHTTPRequestHandler):
         if data.get("review_status") != "pending":
             self._send(422, {"error": "review_status_must_be_pending"})
             return
+        if review_outbox.expiry(data.get("expires_at")) is None:
+            self._send(422, {"error": "invalid_expires_at", "detail": "timezone-aware ISO timestamp required"})
+            return
 
         idem = data.get("idempotency_key")
         if (not isinstance(idem, str) or not idem.strip() or not idem.isprintable()
@@ -439,6 +464,10 @@ class Handler(BaseHTTPRequestHandler):
                 if cur.lastrowid is None:
                     raise sqlite3.DatabaseError("missing inserted row id")
                 row_id = cur.lastrowid
+                review_outbox.enqueue(conn, "notify", row_id, {
+                    **{key: data.get(key) for key in ("signal_type", "symbol", "side", "confidence", "expires_at")},
+                    "id": row_id, "idempotency_key": idem.strip(), "source": source,
+                })
                 conn.commit()
         except sqlite3.IntegrityError:
             self._send(409, {"error": "duplicate_idempotency_key", "idempotency_key": idem})

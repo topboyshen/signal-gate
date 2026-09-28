@@ -199,15 +199,16 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(Path(result["path"]), self.root/"inbox/jd/digest-2026-09-07.json")
 
     def test_nng8_digest_uses_unchanged_hmac_and_no_jd_history(self):
-        body = {"source": "nng8", "target_date": "2026-09-08", "as_of": "2026-09-07",
-                "research_contract": {"report_date": "2026-09-08", "as_of": "2026-09-07",
-                                      "report_sha256": "a" * 64}, "text": "合成研究"}
+        from test_sealed_research import payload, content
+        body = payload(datetime.now(content.TZ))
+        body["produced_at"] = datetime.now(content.TZ).isoformat()
+        body["research_contract"]["completed_at"] = body["produced_at"]
         status, ack = self.pending(body,
                                  path="/hooks/v1/digest-drop", source="nng8")
         self.assertEqual(status, 200)
         self.assertIs(ack["stored"], True)
         self.assertEqual(ack["content_sha256"], hashlib.sha256(json.dumps(body).encode()).hexdigest())
-        self.assertTrue((self.root/"inbox/nng8/research-receipts/2026-09-08.json").is_file())
+        self.assertTrue((self.root/"inbox/nng8/research-receipts"/(body["target_date"] + ".json")).is_file())
         self.assertFalse((self.root/"inbox/nng8/digest-latest.json").exists())
         self.assertFalse((self.root/"inbox/jd").exists())
         self.notify.assert_not_called()

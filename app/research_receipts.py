@@ -9,6 +9,7 @@ import base64
 import binascii
 import fcntl
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -17,6 +18,10 @@ import stat
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
+
+_contract_spec = importlib.util.spec_from_file_location("receiver_research_contract", Path(__file__).with_name("research_contract.py"))
+research_contract = importlib.util.module_from_spec(_contract_spec)
+_contract_spec.loader.exec_module(research_contract)
 
 MAX_RAW_BYTES = 512 * 1024
 MAX_RECORD_BYTES = 2 * MAX_RAW_BYTES
@@ -88,6 +93,13 @@ def _identity(raw):
     as_of = _day(body.get("as_of"))
     if as_of > target:
         raise InvalidRecord("date_order_mismatch")
+    if body.get("signal_type") == "research_skip":
+        skip = body.get("research_skip")
+        if not isinstance(skip, dict) or skip.get("target_date") != target or as_of != target:
+            raise InvalidRecord("invalid_skip_identity")
+        encoded = json.dumps(skip, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        return {"source": "nng8", "target_date": target, "as_of": as_of,
+                "payload_kind": "skip", "skip_sha256": hashlib.sha256(encoded).hexdigest()}
     contract = body.get("research_contract")
     if not isinstance(contract, dict):
         raise InvalidRecord("missing_research_contract")
@@ -162,10 +174,13 @@ def _store_fd(base, *, create=False):
 
 
 def _ack(record):
-    return {"status": "accepted", "source": record["source"], "day": record["as_of"],
+    result = {"status": "accepted", "source": record["source"], "day": record["as_of"],
             "as_of": record["as_of"], "target_date": record["target_date"], "stored": True,
             "content_sha256": record["content_sha256"], "record_id": record["record_id"],
             "stored_at": record["stored_at"]}
+    if record.get("payload_kind") == "skip":
+        result.update(payload_kind="skip", skip_sha256=record["skip_sha256"])
+    return result
 
 
 def _decode_record(encoded, target):
@@ -224,13 +239,20 @@ def read_record(base, source, target_date):
         os.close(fd)
 
 
-def capture(base, raw):
+def capture(base, raw, *, now=None):
     """Atomically create a canonical input, or return its original durable receipt.
 
     A publication/fsync error can leave a complete but unacknowledged record. It
     is never reported as stored by this call and must be investigated read-only.
     """
     identity = _identity(raw)
+    # Do not reserve an immutable date for a contract the renderer will reject.
+    # Historical reads remain byte/identity validation only: never rewrite old
+    # accepted records or pretend a tightened policy was in force in the past.
+    try:
+        research_contract.validate(_json(raw), now or datetime.now(timezone.utc))
+    except (ValueError, TypeError, KeyError, OverflowError):
+        raise InvalidRecord("invalid_research_contract") from None
     target = identity["target_date"]
     fd = _store_fd(base, create=True)
     lock_fd = None

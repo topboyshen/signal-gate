@@ -85,3 +85,41 @@ Then tap **Approve** / **Reject** on the Telegram message in the digest chat.
 ## DB columns (migration-safe)
 
 Added if missing: `decision`, `reviewed_at`, `reviewer`, `quant_status`, `quant_response`.
+
+## Durable side effects (2026-09-28)
+
+`app/review_outbox.py` adds `review_outbox` idempotently; it never rewrites or
+deletes historical review rows, and **never backfills old pending prompts or
+old approvals**. Only new intake creates a `notify` job, in the same transaction
+as the signal. Only a new approval creates a `quant` job, in the same transaction
+as the decision. An invalid/missing/naive expiry is rejected at intake; legacy
+rows with an unknown lifetime also fail closed during approval. Quant rechecks
+the expiry immediately before network delivery.
+
+Both workers claim `pending -> sending` with a SQLite compare-and-set and commit
+before calling a sender. The queue is a wakeup hint, not the record of work.
+After restart, committed `pending` jobs remain eligible; `sending` becomes
+`unknown`, never eligible for automatic replay. A still-running worker may close
+its own claim with the matching claim ID, but another worker cannot claim it.
+Two approval workers cannot create or dispatch two jobs for one signal.
+
+HTTP 2xx means Quant intake acceptance, not a fill. Telegram confirmation needs
+JSON `ok:true`, the expected recipient and a positive `message_id`. Timeout,
+lost acknowledgement, malformed acknowledgement and platform errors remain
+`unknown` and do not trigger automatic resend. Missing configuration leaves a
+durable `pending` job, not an erased notification. Explicit operator reconciliation
+is required for unknown jobs; there is intentionally no generic retry/reset
+command, and records must not be deleted to make queue counts zero.
+
+Read-only operational inspection (no body/recipient/secret export):
+
+```sql
+SELECT kind, status, count(*) FROM review_outbox GROUP BY kind, status;
+SELECT id, kind, signal_id, status, attempts, started_at, completed_at
+FROM review_outbox WHERE status IN ('pending', 'sending', 'unknown') ORDER BY id;
+```
+
+Ordinary restarts can process **new, already-authorized committed pending jobs**;
+review this count before a deployment. Migration itself makes no external calls.
+Old `decision=approve,quant_status IS NULL` rows without an outbox are evidence
+gaps, not permission to resend. Preserve them for read-only reconciliation.

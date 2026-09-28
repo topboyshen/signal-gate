@@ -451,6 +451,9 @@ class Renderer:
 
     def highlights(self, name: str) -> list[str]:
         if name == "nng8" and self.require_sealed_research and self.now.weekday() >= 5:
+            # Retain the explicit local weekend schedule, but do not infer a
+            # weekday holiday from stale/missing research. An authenticated
+            # current-day calendar skip is validated below on any weekday.
             self.sources[name] = {"status": "not_scheduled", "as_of": None, "age_hours": None}
             return ["研究：周末没有计划生成新研究，本栏不沿用旧稿。"]
         data, md = self.source(name)
@@ -625,106 +628,35 @@ class Renderer:
                 + note_lines)
 
     def sealed_research(self, data: dict | None) -> list[str]:
-        """Require a completed current-day sealed-report relay, never old text.
-
-        Hashes here are provenance identifiers, not independent verification of
-        the remote files. The authenticated relay verifies the actual seal.
-        """
+        """Render only a contract accepted by the same pure intake validator."""
         unavailable = ["研究：尚未收到当日通过校验的正式研究摘要；旧稿未纳入。"]
-        contract = data.get("research_contract") if isinstance(data, dict) else None
-        summary = data.get("research_summary") if isinstance(data, dict) else None
-        if not isinstance(data, dict) or not isinstance(contract, dict) or not isinstance(summary, dict):
+        if not isinstance(data, dict) or not (isinstance(data.get("research_contract"), dict)
+                and isinstance(data.get("research_summary"), dict) or isinstance(data.get("research_skip"), dict)):
             self.issue("nng8", "missing")
             return unavailable
         try:
-            if is_noise(data):
-                raise ValueError
-            day = self.now.date().isoformat()
-            if (type(contract.get("version")) is not int or contract["version"] != 1
-                    or contract.get("status") != "ready" or data.get("source") != "nng8"
-                    or contract.get("report_date") != day or data.get("target_date") != day
-                    or contract.get("publication_gate") != "passed"
-                    or contract.get("evidence_review") != "passed"
-                    or contract.get("data_status") not in ("live", "partial")
-                    or contract.get("semantic_review") not in ("not_human_reviewed", "human_passed")):
-                raise ValueError
-            as_of = contract.get("as_of")
-            if not isinstance(as_of, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", as_of) is None:
-                raise ValueError
-            market = parse_date(as_of)
-            if market is None or market.date() >= self.now.date() or data.get("as_of") != as_of:
-                raise ValueError
-            # Validity of the actual previous session was checked by the sealed
-            # upstream report, not inferred using a weekday-only calendar here.
-            for key in ("report_sha256", "last_run_sha256", "context_sha256"):
-                value = contract.get(key)
-                if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-                    raise ValueError
-            times = []
-            for value in (contract.get("completed_at"), data.get("produced_at")):
-                if not isinstance(value, str) or re.search(r"(?:Z|[+-]\d{2}:\d{2})$", value) is None:
-                    raise ValueError
-                stamp = parse_date(value)
-                if stamp is None or stamp.date() != self.now.date() or stamp > self.now:
-                    raise ValueError
-                times.append(stamp)
-            if times[0] > times[1]:
-                raise ValueError
-            def text_value(value):
-                if not isinstance(value, str) or not value.strip() or len(value) > 1200:
-                    raise ValueError
-                result = clean(value, 1200)
-                if not result:
-                    raise ValueError
-                return result
-            conclusion = text_value(summary.get("conclusion"))
-            if re.match(r"^(?:-\s*)?\[(?:事实|推断)\]\s*\S", conclusion) is None:
-                raise ValueError
-            parts = {}
-            for field in ("evidence", "counter_evidence", "risks", "sources", "limitations"):
-                values = summary.get(field)
-                if not isinstance(values, list) or len(values) > 24:
-                    raise ValueError
-                parts[field] = [text_value(value) for value in values]
-            if len(conclusion) + sum(len(v) for values in parts.values() for v in values) > 20000:
-                raise ValueError
-            if not parts["risks"] or not parts["limitations"] or not parts["sources"]:
-                raise ValueError
-            source_ids = set()
-            for entry in parts["sources"]:
-                match = re.fullmatch(r"(?:\[来源\s*([1-9][0-9]*)\]|([1-9][0-9]*)[.、])\s*(\S.*)", entry)
-                if match is None:
-                    raise ValueError
-                identifier = match[1] or match[2]
-                if identifier in source_ids:
-                    raise ValueError
-                source_ids.add(identifier)
-            referenced = research_references("\n".join(
-                [conclusion] + parts["evidence"] + parts["counter_evidence"]
-                + parts["risks"] + parts["limitations"]))
-            if not referenced or not referenced.issubset(source_ids):
-                raise ValueError
-            claim_references = research_references("\n".join([conclusion] + parts["evidence"]))
-            if not claim_references:
-                raise ValueError
-            counter_missing = False
-            if "[推断]" in conclusion:
-                if not parts["evidence"] or not parts["counter_evidence"]:
-                    raise ValueError
-                if any(not research_references(value) for value in parts["evidence"]):
-                    raise ValueError
-                for value in parts["counter_evidence"]:
-                    if research_references(value):
-                        continue
-                    if (re.match(r"^(?:-\s*)?\[推断\]\s*风险[：:]", conclusion) is None
-                            or re.fullmatch(r"(?:反证[：:]\s*)?未提供结构化反证来源，不升级为事实结论。", value) is None
-                            or len(parts["counter_evidence"]) != 1):
-                        raise ValueError
-                    counter_missing = True
+            checked = research_receipts.research_contract.validate(data, self.now)
+            if checked["kind"] == "skip":
+                # A legacy unsigned file is not a calendar attestation.
+                if self.sources.get("nng8", {}).get("receipt_status") != "verified":
+                    raise ValueError("skip_receipt_unverified")
+                self.sources["nng8"]["status"] = "not_scheduled"
+                return ["研究：当日已收到经认证的 XSHG 非交易日证明，无计划新研究；旧稿未纳入。"]
+            contract, analysis = checked["contract"], checked["analysis"]
+            parts = {key: [clean(v, 1200) for v in values] for key, values in checked["parts"].items()}
+            conclusion = clean(checked["conclusion"], 1200)
         except (TypeError, ValueError, KeyError, OverflowError):
             self.issue("nng8", "invalid")
             return unavailable + ["来源提示：研究日期、封存凭证或摘要结构未通过校验。"]
-        lines = [f"研究（报告日 {day}；行情截至 {as_of}；上游完成 {times[0].strftime('%H:%M')}）：", conclusion]
+        lines = [f"研究（报告日 {checked['day']}；行情截至 {checked['as_of']}；上游完成 {checked['completed'].strftime('%H:%M')}）：", conclusion]
+        if analysis:
+            if analysis["inference_status"] == "unverified":
+                lines.append("推断状态：未核验；支持与反证仅保留上游关系，不升级为事实。")
+            if analysis.get("period_note"):
+                lines.append("期间：" + clean(analysis["period_note"], 1200))
+            if analysis["evidence_roles"]:
+                lines.append("证据角色：" + "；".join(
+                    "[来源 " + role["source_id"] + "] " + role["role"] for role in analysis["evidence_roles"]))
         for key, label in (("evidence", "支持证据"), ("counter_evidence", "反证"),
                            ("risks", "风险与数据缺口"), ("sources", "引用来源与时间"),
                            ("limitations", "来源限制")):
@@ -733,7 +665,7 @@ class Renderer:
                 lines.extend("- " + value for value in parts[key])
         lines.append("数据状态：" + ("部分可用" if contract["data_status"] == "partial" else "上游标记可用"))
         lines.append("研究语义：" + ("未经人工审核" if contract["semantic_review"] == "not_human_reviewed" else "上游标记人工审核通过"))
-        if counter_missing:
+        if checked["counter_missing"]:
             lines.append("来源限制：该风险推断未提供可引用反证，固定缺失提示不代表反证已核验。")
         lines.append("仅供研究核对，不构成审批、交易指令或已核验执行结果。")
         return lines

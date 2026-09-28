@@ -24,6 +24,34 @@ reviewed paths explicitly. Credentials, private endpoint files, SQLite databases
 inbox artifacts and generated reports stay outside Git, including their backups.
 Do not use `git add -f` to bypass that boundary.
 
+## Research contract boundary (2026-09-28)
+
+`app/research_contract.py` is the pure shared validator for canonical intake and
+digest rendering. HMAC/timestamp authentication runs first; only a fully valid
+current-day contract may reserve the immutable day. Gate/date/hash/summary/source
+reference failures return 422 **before filesystem writes**. Historical canonical
+records remain byte-bound evidence: reads do not reapply a new current-day rule,
+rewrite old receipts or manufacture earlier availability.
+
+Structured summaries may carry `research_summary.analysis_contract.version=2`.
+Evidence roles, actual reporting periods and stale labels are preserved. An
+inference stays `unverified`; explicitly missing counter-evidence is accepted only
+with its exact scoped limitation, and rendered as a limitation, never as a fake
+counter-example. Legacy basic summaries retain their existing contract; the old
+fixed risk placeholder is displayed under limitations rather than evidence.
+
+An upstream weekday non-trading day is represented by a separate signed
+`signal_type=research_skip` envelope, not by the absence of research. It requires
+the current XSHG target date, `non_trading_day`, ordered calendar neighbours,
+same-day timezone-aware collection/validation/production times, the fixed
+`akshare:sina:trade-calendar` source and the canonical calendar SHA256, plus
+upstream occurrence/run/context proof hashes. Its `skip_sha256` binds the canonical
+`research_skip` object. No report hash is invented. A skip must have a verified
+receiver receipt to render `not_scheduled`; a stale report, missing input or
+unsigned legacy file cannot silence a weekday missing-research alert. The local
+weekend schedule remains unchanged. This trusts authenticated upstream calendar
+evidence; it is not an independent exchange-calendar query by the receiver.
+
 ## Safe offline verification
 
 ```bash

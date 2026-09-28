@@ -7,6 +7,8 @@
 /app/*
 !/app/server.py
 !/app/review_bot.py
+!/app/review_outbox.py
+!/app/research_contract.py
 !/app/digest.py
 !/app/input_status.py
 !/app/digest_content.py
@@ -36,6 +38,8 @@
 !/tests/test_research_receipts.py
 !/tests/test_research_receiver.py
 !/tests/test_input_status.py
+!/tests/test_review_outbox.py
+!/tests/test_research_contract.py
 
 # Defense in depth for runtime material, including nested copies.
 **/*.env
