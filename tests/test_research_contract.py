@@ -103,6 +103,17 @@ class ResearchContractTests(unittest.TestCase):
         self.assertNotIn("\n反证：", rendered)
         self.assertEqual(data, before)
 
+    def test_header_distinguishes_report_date_from_market_data_date(self):
+        data = payload(NOW)
+        self.assertEqual(data["research_contract"]["report_date"], "2026-09-25")
+        self.assertEqual(data["as_of"], "2026-09-24")
+        receipts.capture(self.base, raw(data))
+        report = self.renderer().report()
+        self.assertIn("研报日 2026-09-25", report["text"])
+        self.assertIn("报告日 2026-09-25；行情截至 2026-09-24", report["text"])
+        self.assertNotIn("研报日 2026-09-24", report["text"])
+        self.assertEqual(report["sources"]["nng8"]["report_date"], "2026-09-25")
+
     def test_v2_cannot_claim_verified_or_invent_counter_evidence(self):
         for mutate in (
             lambda a: a.update(inference_status="verified"),
@@ -139,6 +150,18 @@ class ResearchContractTests(unittest.TestCase):
         self.assertEqual(renderer.issues, [])
         self.assertEqual(renderer.sources["nng8"]["status"], "not_scheduled")
         self.assertNotIn("report_sha256", ack)
+        report = self.renderer().report()
+        self.assertIn("研报日 非交易日无新研究", report["text"])
+        self.assertIn("当日为 A 股非交易日", report["text"])
+        self.assertIn("日历来源 akshare:sina:trade-calendar", report["text"])
+        self.assertNotIn("周末", report["text"])
+
+    def test_weekend_without_skip_retains_explicit_weekend_schedule(self):
+        saturday = datetime.fromisoformat("2026-09-26T08:15:00+08:00")
+        report = content.Renderer(self.base, self.base / "unused.db", saturday).report()
+        self.assertIn("研报日 周末无新研究", report["text"])
+        self.assertIn("周末未计划生成新研究", report["text"])
+        self.assertNotIn("nng8:missing", report["issues"])
 
     def test_missing_old_or_unsigned_skip_cannot_become_holiday(self):
         renderer = self.renderer(); renderer.highlights("nng8")

@@ -454,7 +454,8 @@ class Renderer:
             # Retain the explicit local weekend schedule, but do not infer a
             # weekday holiday from stale/missing research. An authenticated
             # current-day calendar skip is validated below on any weekday.
-            self.sources[name] = {"status": "not_scheduled", "as_of": None, "age_hours": None}
+            self.sources[name] = {"status": "not_scheduled", "as_of": None,
+                                  "age_hours": None, "schedule_reason": "weekend"}
             return ["研究：周末没有计划生成新研究，本栏不沿用旧稿。"]
         data, md = self.source(name)
         if name == "nng8" and self.require_sealed_research:
@@ -640,9 +641,13 @@ class Renderer:
                 # A legacy unsigned file is not a calendar attestation.
                 if self.sources.get("nng8", {}).get("receipt_status") != "verified":
                     raise ValueError("skip_receipt_unverified")
-                self.sources["nng8"]["status"] = "not_scheduled"
-                return ["研究：当日已收到经认证的 XSHG 非交易日证明，无计划新研究；旧稿未纳入。"]
+                calendar_source = checked["skip"]["calendar"]["source_id"]
+                self.sources["nng8"].update(status="not_scheduled",
+                    schedule_reason="calendar_non_trading_day", calendar_source_id=calendar_source)
+                return ["研究：当日已收到并验签上游交易日历非交易日证明"
+                        f"（市场 XSHG；日历来源 {calendar_source}）；无计划新研究；旧稿未纳入。"]
             contract, analysis = checked["contract"], checked["analysis"]
+            self.sources["nng8"]["report_date"] = checked["day"]
             parts = {key: [clean(v, 1200) for v in values] for key, values in checked["parts"].items()}
             conclusion = clean(checked["conclusion"], 1200)
         except (TypeError, ValueError, KeyError, OverflowError):
@@ -864,9 +869,13 @@ class Renderer:
             execution = []
 
         nng8 = self.sources.get("nng8") or {}
-        research_stamp = parse_date(nng8.get("as_of"))
+        # The source as_of is the market-data cutoff, not the report date.
+        # Only the shared validator may authorize a report-date label.
+        research_stamp = parse_date(nng8.get("report_date"))
         if nng8.get("status") == "not_scheduled":
-            research_day = "周末无新研究"
+            research_day = ("周末无新研究" if nng8.get("schedule_reason") == "weekend"
+                            else "非交易日无新研究" if nng8.get("schedule_reason") == "calendar_non_trading_day"
+                            else "未通过校验")
         elif "nng8:missing" in self.issues:
             research_day = "缺报"
         elif nng8.get("status") == "ok" and research_stamp:
@@ -904,7 +913,13 @@ class Renderer:
                 lines.append(f"人审：只读快照；最新记录时间 {label}。")
             else:
                 if name == "nng8" and info["status"] == "not_scheduled":
-                    lines.append("研究：周末未计划生成新研究。")
+                    if info.get("schedule_reason") == "weekend":
+                        lines.append("研究：周末未计划生成新研究。")
+                    elif info.get("schedule_reason") == "calendar_non_trading_day":
+                        lines.append("研究：当日为 A 股非交易日；已验签上游日历声明"
+                                     f"（日历来源 {info['calendar_source_id']}），无计划新研究。")
+                    else:
+                        lines.append("研究：未计划生成新研究，原因未通过校验。")
                 elif name == "nng8" and "nng8:missing" in self.issues:
                     lines.append("研究：当日密封摘要缺报，旧稿未纳入。")
                 else:
