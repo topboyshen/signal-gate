@@ -1,5 +1,6 @@
 """Offline sealed-relay contract tests. No production artifacts or network."""
 from datetime import datetime, timedelta
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -49,13 +50,19 @@ class SealedResearchTests(unittest.TestCase):
         self.folder = self.base / 'inbox/nng8'
         self.folder.mkdir(parents=True)
 
-    def render(self, data, now=NOW):
+    def render(self, data, now=NOW, markdown=b'STALE_MD_FALLBACK_MUST_NEVER_LEAK'):
         filename = self.folder / 'digest-latest.json'
         filename.write_text(json.dumps(data, ensure_ascii=False))
-        (self.folder / 'digest-latest.md').write_text('STALE_MD_FALLBACK_MUST_NEVER_LEAK')
+        (self.folder / 'digest-latest.md').write_bytes(markdown)
         before = {file.name: file.read_bytes() for file in self.folder.iterdir()}
         renderer = content.Renderer(self.base, self.base / 'absent.db', now)
-        with patch.object(socket, 'socket', side_effect=AssertionError('network forbidden')):
+        # Isolate contract/render validation after the canonical record reader.
+        # Real receiver/storage/no-alias behavior is covered in test_research_receiver.
+        raw = json.dumps(data, ensure_ascii=False).encode()
+        record = {'stored_at': now.isoformat(), 'content_sha256': hashlib.sha256(raw).hexdigest(),
+                  'record_id': 'rr_' + 'a' * 32}
+        with patch.object(socket, 'socket', side_effect=AssertionError('network forbidden')), \
+             patch.object(content.research_receipts, 'read_record', return_value=(raw, record)):
             lines = renderer.highlights('nng8')
         self.assertEqual(before, {file.name: file.read_bytes() for file in self.folder.iterdir()})
         text = '\n'.join(lines)
@@ -68,18 +75,14 @@ class SealedResearchTests(unittest.TestCase):
             self.assertIn(value, text)
         self.assertEqual(renderer.issues, [])
 
-    def test_missing_contract_never_uses_old_text_or_markdown(self):
+    def test_record_missing_contract_is_invalid_and_never_uses_old_text_or_markdown(self):
         data = payload(); del data['research_contract']
         text, renderer = self.render(data)
         self.assertIn('旧稿未纳入', text)
-        self.assertIn('nng8:missing', renderer.issues)
+        self.assertEqual(renderer.issues, ['nng8:invalid'])
 
     def test_strict_research_never_reads_legacy_markdown_twin(self):
-        data = payload()
-        (self.folder / 'digest-latest.json').write_text(json.dumps(data, ensure_ascii=False))
-        (self.folder / 'digest-latest.md').write_bytes(b'\xff\xfe old invalid markdown')
-        renderer = content.Renderer(self.base, self.base / 'absent.db', NOW)
-        text = '\n'.join(renderer.highlights('nng8'))
+        text, renderer = self.render(payload(), markdown=b'\xff\xfe old invalid markdown')
         self.assertIn('合成研究结论', text)
         self.assertEqual(renderer.issues, [])
 

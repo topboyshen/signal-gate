@@ -170,7 +170,7 @@ class ResearchContractTests(unittest.TestCase):
         for data in (payload(NOW.replace(day=24)), skip_payload()):
             (folder / "digest-latest.json").write_bytes(raw(data))
             renderer = self.renderer(); renderer.highlights("nng8")
-            self.assertIn("nng8:invalid", renderer.issues)
+            self.assertEqual(renderer.issues, ["nng8:missing"])
             self.assertNotEqual(renderer.sources["nng8"]["status"], "not_scheduled")
 
     def test_skip_proof_date_source_market_time_and_hash_are_required(self):

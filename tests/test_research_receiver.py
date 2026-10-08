@@ -156,6 +156,49 @@ class ResearchReceiverTests(unittest.TestCase):
         self.assertEqual(before, self.tree())
         self.assertFalse((folder / "research-receipts").exists())
 
+    def test_missing_current_record_never_reads_legacy_aliases(self):
+        folder = self.base / "inbox/nng8"
+        folder.mkdir(parents=True)
+        stale = json.loads(self.raw)
+        stale["target_date"] = stale["research_contract"]["report_date"] = "2026-09-15"
+        for raw in (self.raw, json.dumps(stale).encode(), b"{broken"):
+            with self.subTest(alias=raw[:20]):
+                (folder / "digest-latest.json").write_bytes(raw)
+                (folder / "digest-latest.md").write_text("OLD_ALIAS_MUST_NOT_BE_USED")
+                before = self.tree()
+                renderer = self.content.Renderer(self.base, self.base / "unused.db", self.now)
+                with patch.object(renderer, "read", side_effect=AssertionError("legacy read forbidden")):
+                    text = "\n".join(renderer.highlights("nng8"))
+                self.assertEqual(renderer.issues, ["nng8:missing"])
+                self.assertEqual(renderer.sources["nng8"]["receipt_status"], "missing")
+                self.assertNotIn("合成研究结论", text)
+                self.assertNotIn("OLD_ALIAS_MUST_NOT_BE_USED", text)
+                self.assertEqual(before, self.tree())
+                self.assertFalse((folder / "research-receipts").exists())
+
+    def test_record_for_another_day_does_not_satisfy_todays_input(self):
+        self.receive()
+        before = self.tree()
+        tomorrow = self.now.replace(day=17)
+        renderer = self.content.Renderer(self.base, self.base / "unused.db", tomorrow)
+        renderer.highlights("nng8")
+        self.assertEqual(renderer.issues, ["nng8:missing"])
+        self.assertEqual(before, self.tree())
+
+    def test_present_record_with_mismatched_identity_is_invalid_not_missing(self):
+        self.receive()
+        record = self.base / "inbox/nng8/research-receipts" / (self.day + ".json")
+        value = json.loads(record.read_bytes())
+        value["target_date"] = "2026-09-15"
+        record.write_text(json.dumps(value))
+        (self.base / "inbox/nng8/digest-latest.json").write_bytes(self.raw)
+        before = self.tree()
+        renderer = self.content.Renderer(self.base, self.base / "unused.db", self.now)
+        text = "\n".join(renderer.highlights("nng8"))
+        self.assertEqual(renderer.issues, ["nng8:invalid"])
+        self.assertNotIn("合成研究结论", text)
+        self.assertEqual(before, self.tree())
+
     def test_bad_post_auth_never_writes_or_notifies(self):
         for headers in ({"X-Signature": ""}, {"X-Timestamp": "1"}, {"X-Source": "unknown"}):
             self.assertEqual(self.request(headers=headers)[0], 401)
@@ -197,7 +240,7 @@ class ResearchReceiverTests(unittest.TestCase):
         renderer = self.content.Renderer(self.base, self.base / "unused.db", self.now)
         text = "\n".join(renderer.highlights("nng8"))
         self.assertNotIn("合成研究结论", text)
-        self.assertIn("nng8:invalid", renderer.issues)
+        self.assertEqual(renderer.issues, ["nng8:invalid"])
         self.assertEqual(before, self.tree())
 
     def test_future_reception_cannot_be_used_by_earlier_consumer(self):

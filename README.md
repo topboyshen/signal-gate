@@ -33,6 +33,12 @@ reference failures return 422 **before filesystem writes**. Historical canonical
 records remain byte-bound evidence: reads do not reapply a new current-day rule,
 rewrite old receipts or manufacture earlier availability.
 
+Production rendering requires a canonical receiver record for the target date.
+When that record does not exist, research is `nng8:missing`; legacy
+`digest-latest.json`/Markdown aliases are not read. A present but corrupted or
+mismatched record remains `nng8:invalid` with no fallback. Unsigned legacy input
+is available only through the explicitly selected non-production parser mode.
+
 Structured summaries may carry `research_summary.analysis_contract.version=2`.
 Evidence roles, actual reporting periods and stale labels are preserved. An
 inference stays `unverified`; explicitly missing counter-evidence is accepted only
@@ -340,9 +346,11 @@ certificate, firewall, private POST URL or credential is changed.
 
 The digest reader consumes the same canonical record for its report date,
 verifies its bytes and observed time, and then applies the unchanged sealed
-research checks. A missing canonical record retains the existing legacy reading
-path **without** inventing a receipt; a corrupt record cannot fall back to an
-apparently healthy alias. Stored does not mean the downstream digest was sent.
+research checks. With sealed research required, a missing canonical record is
+`nng8:missing` and does not read legacy aliases. A corrupt or mismatched record is
+`nng8:invalid` and cannot fall back to an apparently healthy alias. The explicitly
+selected legacy parser mode retains its old reading path without inventing a
+receipt. Stored does not mean the downstream digest was sent.
 
 Run the two additional offline suites with the original five:
 

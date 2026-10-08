@@ -314,7 +314,15 @@ class Renderer:
                     raise ValueError("research_receipt_future")
                 snapshot = (record_raw.decode("utf-8"), research_record)
             except FileNotFoundError:
-                pass  # Legacy fallback remains unverified; no receipt is manufactured.
+                if self.require_sealed_research:
+                    # Absence of today's authenticated record is missing input.
+                    # An old alias cannot stand in for it, even if its body claims
+                    # today's date; only the receiver may establish availability.
+                    self.issue(name, "missing")
+                    self.sources[name] = {"status": "missing", "as_of": None,
+                                          "age_hours": None, "receipt_status": "missing"}
+                    return None, ""
+                # Explicit legacy parser mode retains unsigned input support.
             except (OSError, ValueError, RecursionError):
                 self.issue(name, "invalid")
                 self.sources[name] = {"status": "invalid", "as_of": None,
@@ -633,7 +641,8 @@ class Renderer:
         unavailable = ["研究：尚未收到当日通过校验的正式研究摘要；旧稿未纳入。"]
         if not isinstance(data, dict) or not (isinstance(data.get("research_contract"), dict)
                 and isinstance(data.get("research_summary"), dict) or isinstance(data.get("research_skip"), dict)):
-            self.issue("nng8", "missing")
+            receipt_status = self.sources.get("nng8", {}).get("receipt_status")
+            self.issue("nng8", "invalid" if receipt_status in {"verified", "invalid"} else "missing")
             return unavailable
         try:
             checked = research_receipts.research_contract.validate(data, self.now)
