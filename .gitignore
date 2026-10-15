@@ -58,3 +58,4 @@
 **/*.log
 **/.venv/
 **/venv/
+.test-runs/
