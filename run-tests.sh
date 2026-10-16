@@ -80,7 +80,7 @@ if [[ "$MODE" == "reviewed" ]]; then
   for suite in "${REVIEWED_SUITES[@]}"; do
     test -f "tests/$suite" || { echo "missing suite: $suite" >>"$LOG_FILE"; rc=1; break; }
     "${PREFIX[@]}" env PYTHONDONTWRITEBYTECODE=1 \
-      timeout 4 /tmp/timeout-stub-20261016T010405Z.py \
+      timeout 60 /usr/bin/python3 -B -m unittest discover -s tests -p "$suite" -v \
       >> "$LOG_FILE" 2>&1 || { rc=1; break; }
   done
 else
