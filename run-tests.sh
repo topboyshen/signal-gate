@@ -1,10 +1,13 @@
 #!/bin/bash
-# signal-gate 测试执行体 (v4, 含 --reviewed 模式)
-# 由 /usr/local/bin/run-tests-launcher 启动 (root + 全局锁 + systemd-run scope).
-# 直接执行仅在不与锁冲突的两种情况下允许:
-#   (1) RUNNER_HOLDLOCK=1  (父进程是受控启动层并已持锁)
-#   (2) 该进程自身能拿到全局锁 (root 守护场景; 非 root 若锁存在但无写权限会被拒)
-# 否则明确拒绝 (exit 9), 杜绝"裸跑无硬限额"路径.
+# signal-gate 测试执行体 (v5, 含 --reviewed 模式)
+# 由受控启动层调用. 关键变更 (v4 → v5):
+#   - RUNNER_HOLDLOCK=1 不再作为保护生效证据, 仅作"父进程意图"提示
+#   - 启动时实际验证:
+#       A) 本进程或祖先持有全局锁 (/proc/locks 检查)
+#       B) 当前 cgroup 有真实 cpu.max / memory.max 硬限额 (读 /sys/fs/cgroup/<cg>/)
+#     任一验证失败 → exit 9, 不进入测试执行
+#   - 业务用户锁外裸跑拒 (exit 2); root 锁外裸跑拒 (exit 9)
+
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -24,42 +27,36 @@ for a in "$@"; do
 done
 if (( ${#args[@]} > 0 )); then set -- "${args[@]}"; else set --; fi
 
-if [[ "${RUNNER_HOLDLOCK:-}" == "1" ]]; then
-  HELD_BY_PARENT=1
-elif [[ "$(id -u)" == "0" ]]; then
-  # root 单跑 (preflight 经 wrapper 已是这层, 但保留 root 兜底兼容)
-  exec 200>"$GLOBAL_LOCK"
-  if ! flock -n 200; then
-    echo "SKIP: 另一测试/preflight 进程持有全局锁 ($GLOBAL_LOCK), 防重生效" >&2
-    exit 75
-  fi
-  HELD_BY_PARENT=0
-else
-  echo "FAIL: 非 root 路径必须经 /usr/local/bin/run-tests-launcher 启动 (RUNNER_HOLDLOCK=1)" >&2
-  echo "      直接执行无法建立 CPUQuota/MemoryMax 硬限额, 拒绝运行" >&2
+# --- 保护层实证 (v5) ---
+PROTECT_LIB="${PROTECT_LIB_PATH:-/usr/local/lib/vpstest/protection-lib.sh}"
+[[ -r "$PROTECT_LIB" ]] || { echo "FAIL: $PROTECT_LIB 不可读 (protection 库未部署)" >&2; exit 9; }
+# shellcheck disable=SC1090
+source "$PROTECT_LIB"
+
+if ! verify_lock_held_by_self_or_ancestor "$GLOBAL_LOCK"; then
+  echo "FAIL: 本进程或祖先未持有全局锁 $GLOBAL_LOCK (/proc/locks 验证)" >&2
+  echo "      请经 /usr/local/bin/run-tests-launcher 受控启动, 或 vps-preflight-safe 内运行" >&2
   exit 9
 fi
 
-if [[ "$(id -u)" == "0" && "$HELD_BY_PARENT" == "0" ]]; then
-  if command -v systemd-run >/dev/null 2>&1; then
-    PREFIX=(systemd-run --scope --quiet --collect
-      -p CPUQuota=70% -p MemoryMax=800M -p MemorySwapMax=0
-      nice -n 19 ionice -c3)
-  else
-    echo "FAIL: root 裸跑路径下 systemd-run 不可用" >&2
-    exit 9
-  fi
-elif [[ "$(id -u)" == "0" ]]; then
-  PREFIX=(nice -n 19)
-else
-  PREFIX=(nice -n 19)
+# cgroup 期望: CPU ≤ 70%, memory ≤ 800MiB (允许更严, 不允许更松)
+if ! verify_cgroup_limits_or_die 70 $((800*1024*1024)); then
+  echo "FAIL: 当前 cgroup 缺少硬限额或超过预算" >&2
+  echo "      请经 /usr/local/bin/run-tests-launcher 受控启动 (建立 systemd-run scope)" >&2
+  exit 9
 fi
+
+# 通过实证后:
+PREFIX=(nice -n 19)
+LOCK_EVIDENCE="flock verified via /proc/locks (holder pid in self/ancestor lineage)"
+CGROUP_EVIDENCE="$(cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/cpu.max 2>/dev/null)/$(cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.max 2>/dev/null)"
 
 {
   echo "=== signal-gate test run $TS mode=$MODE ==="
-  echo "user: $(id -un)($(id -u)) host: $(hostname) held_by_parent=$HELD_BY_PARENT"
+  echo "user: $(id -un)($(id -u)) host: $(hostname)"
   echo "load: $(cat /proc/loadavg)"
-  echo "prefix: ${PREFIX[*]}"
+  echo "lock-evidence: $LOCK_EVIDENCE"
+  echo "cgroup-evidence: $CGROUP_EVIDENCE"
   echo
 } >> "$LOG_FILE" 2>&1
 
@@ -74,7 +71,9 @@ rc=0
 if [[ "$MODE" == "reviewed" ]]; then
   for suite in "${REVIEWED_SUITES[@]}"; do
     test -f "tests/$suite" || { echo "missing suite: $suite" >>"$LOG_FILE"; rc=1; break; }
-    "${PREFIX[@]}" env PYTHONDONTWRITEBYTECODE=1       timeout 60 /usr/bin/python3 -B -m unittest discover -s tests -p "$suite" -v       >> "$LOG_FILE" 2>&1 || { rc=1; break; }
+    "${PREFIX[@]}" env PYTHONDONTWRITEBYTECODE=1 \
+      timeout 60 /usr/bin/python3 -B -m unittest discover -s tests -p "$suite" -v \
+      >> "$LOG_FILE" 2>&1 || { rc=1; break; }
   done
 else
   shopt -s nullglob
@@ -86,18 +85,17 @@ else
   for f in "${patterns[@]}"; do
     pattern=$(basename "$f")
     echo "== ${pattern%.py} ==" >> "$LOG_FILE"
-    "${PREFIX[@]}" env PYTHONDONTWRITEBYTECODE=1 python3 -B       -m unittest discover -s tests -p "$pattern"       >> "$LOG_FILE" 2>&1 || rc=1
+    "${PREFIX[@]}" env PYTHONDONTWRITEBYTECODE=1 python3 -B \
+      -m unittest discover -s tests -p "$pattern" \
+      >> "$LOG_FILE" 2>&1 || rc=1
   done
 fi
 
 ls -1t .test-runs/run-*.log 2>/dev/null | tail -n +31 | xargs -r rm -f -- 2>/dev/null || true
 echo "" >> "$LOG_FILE"
 echo "=== finished exit=$rc at $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$LOG_FILE"
-if [[ "$HELD_BY_PARENT" == "1" ]]; then
-  echo "resource-limits: enforced by run-tests-launcher (CPUQuota=70% MemoryMax=800M; lock held by parent)" >> "$LOG_FILE"
-elif [[ "$(id -u)" == "0" ]]; then
-  echo "resource-limits: CPUQuota=70% MemoryMax=800M (root systemd-run scope)" >> "$LOG_FILE"
-fi
+echo "lock-evidence: $LOCK_EVIDENCE" >> "$LOG_FILE"
+echo "cgroup-evidence: $CGROUP_EVIDENCE" >> "$LOG_FILE"
 echo "log: $LOG_FILE"
 tail -25 "$LOG_FILE"
 exit "${rc:-0}"
