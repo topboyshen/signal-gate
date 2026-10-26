@@ -75,6 +75,17 @@ class SealedResearchTests(unittest.TestCase):
             self.assertIn(value, text)
         self.assertEqual(renderer.issues, [])
 
+    def test_generated_bullet_markers_are_not_doubled(self):
+        data = payload()
+        data['research_summary']['conclusion'] = '- [事实] [来源 2] 合成结论待核实。'
+        data['research_summary']['evidence'] = ['- [事实] [来源 2] 合成结论待核实。',
+                                               '- [来源 3] 独立证据']
+        text, renderer = self.render(data)
+        self.assertEqual(text.count('合成结论待核实'), 1, '结论不得在支持证据里重复出现')
+        self.assertNotIn('- - ', text, '不得出现双层列表符号')
+        self.assertIn('- [来源 3] 独立证据', text)
+        self.assertEqual(renderer.issues, [])
+
     def test_record_missing_contract_is_invalid_and_never_uses_old_text_or_markdown(self):
         data = payload(); del data['research_contract']
         text, renderer = self.render(data)

@@ -109,6 +109,27 @@ def clean(value: object, limit: int = MAX_TEXT) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+_BULLET_PREFIX = re.compile(r"^\s*[-*+]\s+")
+
+
+def bullet_text(value: str) -> str:
+    """上游条目自带列表符号时只保留一份，避免渲染成 "- - "。"""
+    return _BULLET_PREFIX.sub("", value, count=1).strip()
+
+
+def bullet_lines(values: list[str], *, drop: tuple[str, ...] = ()) -> list[str]:
+    """去掉列表符号与重复条目；drop 用于剔除已单独渲染的结论。"""
+    seen = set(drop)
+    out = []
+    for value in values:
+        text = bullet_text(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
 def freshness_stamp(stamp: datetime | None, source_value: object) -> datetime | None:
     """Date-only stamps count as end of that local day for the 72h freshness window.
 
@@ -658,7 +679,7 @@ class Renderer:
             contract, analysis = checked["contract"], checked["analysis"]
             self.sources["nng8"]["report_date"] = checked["day"]
             parts = {key: [clean(v, 1200) for v in values] for key, values in checked["parts"].items()}
-            conclusion = clean(checked["conclusion"], 1200)
+            conclusion = bullet_text(clean(checked["conclusion"], 1200))
         except (TypeError, ValueError, KeyError, OverflowError):
             self.issue("nng8", "invalid")
             return unavailable + ["来源提示：研究日期、封存凭证或摘要结构未通过校验。"]
@@ -674,9 +695,11 @@ class Renderer:
         for key, label in (("evidence", "支持证据"), ("counter_evidence", "反证"),
                            ("risks", "风险与数据缺口"), ("sources", "引用来源与时间"),
                            ("limitations", "来源限制")):
-            if parts[key]:
+            drop = (conclusion,) if key == "evidence" and conclusion else ()
+            bullets = bullet_lines(parts[key], drop=drop)
+            if bullets:
                 lines.append(label + "：")
-                lines.extend("- " + value for value in parts[key])
+                lines.extend("- " + value for value in bullets)
         lines.append("数据状态：" + ("部分可用" if contract["data_status"] == "partial" else "上游标记可用"))
         lines.append("研究语义：" + ("未经人工审核" if contract["semantic_review"] == "not_human_reviewed" else "上游标记人工审核通过"))
         if checked["counter_missing"]:
