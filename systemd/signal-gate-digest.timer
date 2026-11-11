@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Signal Gate daily digest after sealed research at 08:15 Asia/Shanghai
+Description=Run combined morning briefing via Signal Gate digest at 08:30 Asia/Shanghai
 
 [Timer]
-OnCalendar=*-*-* 08:15:00 Asia/Shanghai
+OnCalendar=*-*-* 08:30:00 Asia/Shanghai
 RandomizedDelaySec=30s
 AccuracySec=1m
 Persistent=false

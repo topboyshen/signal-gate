@@ -248,7 +248,7 @@ class SealedResearchTests(unittest.TestCase):
 
     def test_schedule_follows_research_generation(self):
         timer = (Path(__file__).resolve().parents[1] / 'systemd/signal-gate-digest.timer').read_text()
-        self.assertIn('OnCalendar=*-*-* 08:15:00 Asia/Shanghai', timer)
+        self.assertIn('OnCalendar=*-*-* 08:30:00 Asia/Shanghai', timer)
         self.assertNotIn('OnCalendar=*-*-* 08:00:', timer)
 
 

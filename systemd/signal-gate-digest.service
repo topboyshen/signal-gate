@@ -12,6 +12,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=SIGNAL_GATE_HOME=/opt/signal-gate
 Environment=SIGNAL_GATE_DB=/opt/signal-gate/data/signals.db
 Environment=SIGNAL_GATE_SECRETS=/opt/signal-gate/secrets.env
+Environment=SIGNAL_GATE_BRIEFING_DIR=/var/lib/morning-briefing
 EnvironmentFile=-/opt/signal-gate/secrets.env
 ExecStart=/usr/bin/python3 /opt/signal-gate/app/digest.py
 TimeoutStartSec=120
@@ -35,5 +36,6 @@ RestrictNamespaces=true
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/opt/signal-gate/data /opt/signal-gate/inbox /opt/signal-gate/out
+ReadOnlyPaths=/var/lib/morning-briefing
 MemoryMax=96M
 TasksMax=32

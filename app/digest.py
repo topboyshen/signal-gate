@@ -19,21 +19,27 @@ import urllib.error
 import urllib.request
 from zoneinfo import ZoneInfo
 
-try:
-    from digest_content import build_report
-except ModuleNotFoundError as exc:
-    if exc.name != "digest_content":
-        raise
-    # spec-based offline loaders do not add app/ to sys.path. Load the explicit
-    # sibling instead of changing global import paths or consulting production.
-    import importlib.util
-    _content_spec = importlib.util.spec_from_file_location(
-        "signal_gate_digest_content", Path(__file__).with_name("digest_content.py")
-    )
-    assert _content_spec is not None and _content_spec.loader is not None
-    _content = importlib.util.module_from_spec(_content_spec)
-    _content_spec.loader.exec_module(_content)
-    build_report = _content.build_report
+def _load_sibling(module_name: str, attribute: str):
+    try:
+        module = __import__(module_name, fromlist=[attribute])
+        return getattr(module, attribute)
+    except ModuleNotFoundError as exc:
+        if exc.name != module_name:
+            raise
+        # spec-based offline loaders do not add app/ to sys.path. Load the explicit
+        # sibling instead of changing global import paths or consulting production.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            f"signal_gate_{module_name}", Path(__file__).with_name(f"{module_name}.py")
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return getattr(module, attribute)
+
+
+build_report = _load_sibling("digest_content", "build_report")
+compose_morning_briefing = _load_sibling("briefing", "compose_morning_briefing")
 
 BASE = Path(os.environ.get("SIGNAL_GATE_HOME", "/opt/signal-gate"))
 DB_PATH = Path(os.environ.get("SIGNAL_GATE_DB", str(BASE / "data" / "signals.db")))
@@ -92,7 +98,7 @@ def split_text(text: str, limit: int = MAX_PART_CHARS) -> list[str]:
 
 def code_version() -> str:
     digest = hashlib.sha256()
-    for name in ("digest.py", "digest_content.py", "news_history.py", "research_receipts.py", "research_contract.py"):
+    for name in ("digest.py", "digest_content.py", "briefing.py", "news_history.py", "research_receipts.py", "research_contract.py"):
         digest.update(name.encode() + b"\0")
         digest.update(Path(__file__).with_name(name).read_bytes())
     return digest.hexdigest()
@@ -305,7 +311,22 @@ def _event(day: str, status: str, code: str, receipt: dict | None = None) -> Non
           f"issues={len(receipt['issues']) if receipt else 0}")
 
 
-def run_digest(*, dry_run: bool = False, json_output: bool = False, now: datetime | None = None) -> int:
+
+def _composed_report(now: datetime, day: str, briefing_dir: Path | None) -> dict:
+    report = build_report(BASE, DB_PATH, now=now)
+    if briefing_dir is not None:
+        report = compose_morning_briefing(report, now, briefing_dir)
+    return _validated_report(report, day)
+
+
+def _briefing_dir(explicit: Path | None = None) -> Path | None:
+    if explicit is not None:
+        return Path(explicit)
+    raw = os.environ.get("SIGNAL_GATE_BRIEFING_DIR", "").strip()
+    return Path(raw) if raw else None
+
+
+def run_digest(*, dry_run: bool = False, json_output: bool = False, now: datetime | None = None, briefing_dir: Path | None = None) -> int:
     now = datetime.now(TZ) if now is None else now.astimezone(TZ)
     day = now.date().isoformat()
     deadline = time.monotonic() + DELIVERY_BUDGET_SECONDS
@@ -319,7 +340,7 @@ def run_digest(*, dry_run: bool = False, json_output: bool = False, now: datetim
         return 1
     if dry_run:
         try:
-            report = _validated_report(build_report(BASE, DB_PATH, now=now), day)
+            report = _composed_report(now, day, _briefing_dir(briefing_dir))
             preview = {"schema_version": 1, "report_date": day, "status": "dry_run",
                        "generated_at": now.isoformat(), "issues": report["issues"],
                        "degraded": report["degraded"], "code_version": version,
@@ -373,7 +394,7 @@ def run_digest(*, dry_run: bool = False, json_output: bool = False, now: datetim
             _event(day, "blocked", receipt["last_error_code"], receipt)
             return 1
         try:
-            report = _validated_report(build_report(BASE, DB_PATH, now=now), day)
+            report = _composed_report(now, day, _briefing_dir(briefing_dir))
         except Exception:
             receipt = receipt or _new_receipt(day, now, version, "", [])
             raise DeliveryError("render_failed") from None
@@ -445,10 +466,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Signal Gate daily digest")
     parser.add_argument("--dry-run", action="store_true", help="render without credentials, delivery or state writes")
     parser.add_argument("--json", action="store_true", help="safe metadata only; requires --dry-run")
+    parser.add_argument("--briefing-dir", type=Path, default=None,
+                        help="optional overseas/VPS section directory; also SIGNAL_GATE_BRIEFING_DIR")
     args = parser.parse_args([] if argv is None else argv)
     if args.json and not args.dry_run:
         parser.error("--json requires --dry-run")
-    return run_digest(dry_run=args.dry_run, json_output=args.json)
+    return run_digest(dry_run=args.dry_run, json_output=args.json, briefing_dir=args.briefing_dir)
 
 
 if __name__ == "__main__":

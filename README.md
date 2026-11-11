@@ -7,7 +7,7 @@ Minimal localhost HMAC receiver for pending A-share signals on dedirock.
 - Secrets: `/opt/signal-gate/secrets.env` (mode 600)
 - Data: `/opt/signal-gate/data/signals.db`
 - Digest out: `/opt/signal-gate/out/daily-YYYY-MM-DD.md`
-- Units: `signal-gate.service`, `signal-gate-digest.timer` (08:15 Asia/Shanghai)
+- Units: `signal-gate.service`, `signal-gate-digest.timer` (08:30 Asia/Shanghai combined morning briefing)
 
 The existing HTTPS entry was explicitly approved on 2026-09-08. Its private
 routes remain outside this repository; the relay and included snippet are
@@ -83,16 +83,16 @@ They require separate authorization for the exact live actions. See
 
 ## Digest schedule
 
-The timer specifies `OnCalendar=*-*-* 08:15:00 Asia/Shanghai`, so its calendar
+The timer specifies `OnCalendar=*-*-* 08:30:00 Asia/Shanghai`, so its calendar
 does not depend on the server's local timezone. `RandomizedDelaySec=30s`,
-`AccuracySec=1m` are retained; execution may be delayed from 08:15.
+`AccuracySec=1m` are retained; execution may be delayed from 08:30.
 `Persistent=false` avoids catching up and sending an outdated morning report
 after a late reboot or a timer migration. A missed morning delivery is reported
 by the watchdog; it is not automatically resent in the afternoon.
 `Timezone=` is not a valid timer directive.
 
 ```bash
-systemd-analyze calendar '*-*-* 08:15:00 Asia/Shanghai'
+systemd-analyze calendar '*-*-* 08:30:00 Asia/Shanghai'
 ```
 
 This command only validates the calendar. Applying a changed unit requires a
@@ -167,7 +167,7 @@ conservative mechanism does not claim absolute exactly-once delivery or that a
 human read the message. Manual resend/reconciliation requires explicit approval.
 
 The separate infra watchdog starts monitoring receipt-based delivery on
-2026-09-09, after the 08:25 deadline, with bounded morning rechecks. It alerts only
+2026-09-09, after the 08:40 deadline, with bounded morning rechecks. It alerts only
 for missing/failed/unknown delivery or degraded data, deduplicates an incident and
 records recovery silently. Normal days produce no extra Telegram message. The
 rollout does not fabricate a receipt for the legacy 09-08 message or resend it.
@@ -218,8 +218,8 @@ notification chain stays intact. A successful draft/seal job additionally queues
 the research relay, with independent checks at 08:05 and 08:10. The relay validates
 today's completed occurrence, run gates, report bytes and seal hashes before
 reading the **formal report**, not the XHS draft body or old EOD template. Posting
-closes at 08:14, reserving time before the 08:15 merge; the relay unit is bounded
-to 45 seconds plus a 5-second stop allowance. The 08:25
+closes at 08:14, well before the 08:30 merge; the relay unit is bounded
+to 45 seconds plus a 5-second stop allowance. The 08:40
 watchdog checks confirmed delivery and quality without extra healthy-day messages.
 
 Production requires `research_contract` version 1, ready status, today's report
